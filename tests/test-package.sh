@@ -10,16 +10,16 @@ if [ "$#" -eq 1 ]; then
 else
   first_output="${test_root}/first"
   second_output="${test_root}/second"
-  "$repository_root/bin/package-skill" 0.1.1 "$first_output" >/dev/null
-  "$repository_root/bin/package-skill" 0.1.1 "$second_output" >/dev/null
-  archive="${first_output}/project-context-skill-v0.1.1.tar.gz"
-  cmp "$archive" "${second_output}/project-context-skill-v0.1.1.tar.gz"
+  "$repository_root/bin/package-skill" 0.1.2 "$first_output" >/dev/null
+  "$repository_root/bin/package-skill" 0.1.2 "$second_output" >/dev/null
+  archive="${first_output}/project-context-skill-v0.1.2.tar.gz"
+  cmp "$archive" "${second_output}/project-context-skill-v0.1.2.tar.gz"
   (
     cd "$first_output"
     if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum -c project-context-skill-v0.1.1.tar.gz.sha256
+      sha256sum -c project-context-skill-v0.1.2.tar.gz.sha256
     else
-      shasum -a 256 -c project-context-skill-v0.1.1.tar.gz.sha256
+      shasum -a 256 -c project-context-skill-v0.1.2.tar.gz.sha256
     fi
   )
 fi
@@ -79,9 +79,9 @@ if [ -x "$debug_binary" ]; then
   machine_name=$(uname -m)
   case "$system_name" in Darwin) target_system=apple-darwin ;; Linux) target_system=unknown-linux-gnu ;; esac
   case "$machine_name" in x86_64|amd64) target_arch=x86_64 ;; arm64|aarch64) target_arch=aarch64 ;; esac
-  release_root="${test_root}/release/v0.1.1"
+  release_root="${test_root}/release/v0.1.2"
   mkdir -p "$release_root"
-  asset="${release_root}/project-context-v0.1.1-${target_arch}-${target_system}"
+  asset="${release_root}/project-context-v0.1.2-${target_arch}-${target_system}"
   cp "$debug_binary" "$asset"
   chmod 700 "$asset"
   if command -v sha256sum >/dev/null 2>&1; then
