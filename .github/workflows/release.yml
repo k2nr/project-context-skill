@@ -26,10 +26,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --manifest-path cli/Cargo.toml -- --check
       - name: Audit Rust dependencies
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ github.token }}
-          working-directory: cli
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file cli/Cargo.lock
       - name: Check shell files
         run: |
           shellcheck project-context/bin/project-context bin/package-skill tests/*.sh
