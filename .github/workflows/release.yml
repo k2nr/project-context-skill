@@ -31,10 +31,12 @@ jobs:
           cargo audit --file cli/Cargo.lock
       - name: Check shell files
         run: |
-          shellcheck project-context/bin/project-context bin/package-skill tests/*.sh
+          shellcheck project-context/bin/project-context bin/* tests/*.sh
           sh -n project-context/bin/project-context
-          sh -n bin/package-skill
+          for script_file in bin/*; do sh -n "${script_file}"; done
           for test_file in tests/*.sh; do sh -n "${test_file}"; done
+      - name: Validate Codex skill contract
+        run: bin/validate-skill project-context
       - name: Check workflow syntax
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
@@ -42,7 +44,10 @@ jobs:
       - name: Test launcher and package
         run: |
           tests/test-bootstrap.sh project-context/bin/project-context
+          tests/test-skill-validator.sh
           tests/test-package.sh
+          tests/test-installer-package.sh
+          tests/test-installer.sh
 
   build-linux:
     needs: test
@@ -156,8 +161,10 @@ jobs:
         run: |
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml | head -n 1)
           launcher_version=$(sed -n 's/^PROJECT_CONTEXT_VERSION="\([^"]*\)"/\1/p' project-context/bin/project-context | head -n 1)
+          installer_version=$(sed -n 's/^PROJECT_CONTEXT_VERSION="\([^"]*\)"/\1/p' bin/install-project-context | head -n 1)
           test "${GITHUB_REF_NAME}" = "v${package_version}"
           test "${package_version}" = "${launcher_version}"
+          test "${package_version}" = "${installer_version}"
           test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
           remote_tag_sha=$(git ls-remote origin "refs/tags/${GITHUB_REF_NAME}^{}" | awk 'NR == 1 { print $1 }')
           if test -z "${remote_tag_sha}"; then
@@ -172,14 +179,19 @@ jobs:
             exit 1
           fi
           grep -Fq "PROJECT_CONTEXT_RELEASE_REPOSITORY=\"${GITHUB_REPOSITORY}\"" project-context/bin/project-context
+          grep -Fq "PROJECT_CONTEXT_RELEASE_REPOSITORY=\"${GITHUB_REPOSITORY}\"" bin/install-project-context
           grep -Fq "github.com/${GITHUB_REPOSITORY}" README.md
       - name: Package project-installed skill
-        run: bin/package-skill "${GITHUB_REF_NAME#v}" release-assets
+        run: |
+          bin/package-skill "${GITHUB_REF_NAME#v}" release-assets
+          bin/package-installer "${GITHUB_REF_NAME#v}" release-assets
       - name: Verify release assets
         shell: bash
         run: |
           version="${GITHUB_REF_NAME}"
           cat > expected-assets.txt <<EOF
+          install-project-context-${version}
+          install-project-context-${version}.sha256
           project-context-${version}-aarch64-apple-darwin
           project-context-${version}-aarch64-apple-darwin.sha256
           project-context-${version}-aarch64-unknown-linux-gnu
@@ -196,6 +208,7 @@ jobs:
           diff -u expected-assets.txt actual-assets.txt
           (cd release-assets && sha256sum --check ./*.sha256)
           tests/test-package.sh "release-assets/project-context-skill-${version}.tar.gz"
+          tests/test-installer-package.sh
       - name: Attest release assets
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:

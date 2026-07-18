@@ -29,6 +29,20 @@ pub struct InitReport {
     pub files: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ConfigureReport {
+    pub updated: Vec<String>,
+}
+
+pub struct ConfigureInput {
+    pub project_id: Option<String>,
+    pub description: Option<String>,
+    pub build: Vec<String>,
+    pub test: Vec<String>,
+    pub lint: Vec<String>,
+    pub format: Vec<String>,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct ValidationReport {
     pub valid: bool,
@@ -365,6 +379,113 @@ pub fn load_valid_repository(root: &Path) -> Result<RepositoryData, StoreError> 
     } else {
         Err(StoreError::Invalid(report))
     }
+}
+
+pub fn configure(root: &Path, input: ConfigureInput) -> Result<ConfigureReport, StoreError> {
+    let lock = open_lock(root, true).map_err(StoreError::Environment)?;
+    recover_init_transaction(root).map_err(StoreError::Environment)?;
+    let documents = read_documents(root)?;
+    let (current_report, _) = inspect_documents(
+        &documents.model_schema,
+        &documents.event_schema,
+        &documents.model,
+        &documents.events,
+    );
+    if !current_report.valid {
+        let _ = lock.unlock();
+        return Err(StoreError::Invalid(current_report));
+    }
+
+    let mut model: serde_yaml_ng::Value = serde_yaml_ng::from_str(&documents.model)
+        .map_err(|error| StoreError::Environment(format!("cannot parse model.yaml: {error}")))?;
+    let model_mapping = model
+        .as_mapping_mut()
+        .ok_or_else(|| StoreError::Environment("model.yaml root must be a mapping".to_owned()))?;
+    let mut updated = Vec::new();
+
+    if input.project_id.is_some() || input.description.is_some() {
+        let project = model_mapping
+            .get_mut(serde_yaml_ng::Value::String("project".to_owned()))
+            .and_then(serde_yaml_ng::Value::as_mapping_mut)
+            .ok_or_else(|| {
+                StoreError::Environment("model.yaml has no project mapping".to_owned())
+            })?;
+        if let Some(value) = input.project_id {
+            project.insert(
+                serde_yaml_ng::Value::String("id".to_owned()),
+                serde_yaml_ng::Value::String(value),
+            );
+            updated.push("project.id".to_owned());
+        }
+        if let Some(value) = input.description {
+            project.insert(
+                serde_yaml_ng::Value::String("description".to_owned()),
+                serde_yaml_ng::Value::String(value),
+            );
+            updated.push("project.description".to_owned());
+        }
+    }
+
+    let operation_updates = [
+        ("build", input.build),
+        ("test", input.test),
+        ("lint", input.lint),
+        ("format", input.format),
+    ];
+    if operation_updates
+        .iter()
+        .any(|(_, commands)| !commands.is_empty())
+    {
+        let operations = model_mapping
+            .get_mut(serde_yaml_ng::Value::String("operations".to_owned()))
+            .and_then(serde_yaml_ng::Value::as_mapping_mut)
+            .ok_or_else(|| {
+                StoreError::Environment("model.yaml has no operations mapping".to_owned())
+            })?;
+        for (name, commands) in operation_updates {
+            if commands.is_empty() {
+                continue;
+            }
+            operations.insert(
+                serde_yaml_ng::Value::String(name.to_owned()),
+                serde_yaml_ng::Value::Sequence(
+                    commands
+                        .into_iter()
+                        .map(serde_yaml_ng::Value::String)
+                        .collect(),
+                ),
+            );
+            updated.push(format!("operations.{name}"));
+        }
+    }
+
+    if updated.is_empty() {
+        let _ = lock.unlock();
+        return Ok(ConfigureReport { updated });
+    }
+    let proposed_model = serde_yaml_ng::to_string(&model).map_err(|error| {
+        StoreError::Environment(format!("cannot serialize model.yaml: {error}"))
+    })?;
+    let (proposed_report, _) = inspect_documents(
+        &documents.model_schema,
+        &documents.event_schema,
+        &proposed_model,
+        &documents.events,
+    );
+    if !proposed_report.valid {
+        let _ = lock.unlock();
+        return Err(StoreError::Invalid(proposed_report));
+    }
+    let warnings = atomic_write(
+        &root.join(".project-context/model.yaml"),
+        proposed_model.as_bytes(),
+    )
+    .map_err(StoreError::Environment)?;
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    let _ = lock.unlock();
+    Ok(ConfigureReport { updated })
 }
 
 pub fn add_decision(root: &Path, input: DecisionInput) -> Result<Value, StoreError> {

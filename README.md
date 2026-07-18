@@ -13,42 +13,75 @@ receives its own project-installed skill and context store.
 
 ## Install with a Coding Agent
 
-The installation flow is:
-
-1. Copy the instruction below.
-2. Send it to the coding agent working in the target repository.
-3. Let the agent verify and install the skill, maintain the managed `AGENTS.md`
-   block, initialize repository data, populate the discovered project details,
-   and validate the result.
+The installation flow uses a standalone, checksummed, and attested installer.
+The installer verifies the skill release before any repository write, performs a
+dry run, refuses local differences, maintains the managed `AGENTS.md` block,
+initializes or preserves canonical data, and returns a machine-readable report.
 
 The official GitHub repository is `k2nr/project-context-skill`.
 
 Copy this instruction verbatim:
 
 ```text
-Install Project Context v0.1.6 into the current repository.
+Install Project Context v0.1.7 into the current repository.
 
 Official GitHub repository:
 k2nr/project-context-skill
 
 Installation requirements:
-1. Work from the target repository root.
-2. Download these assets for tag v0.1.6 into a private temporary directory:
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.6/project-context-skill-v0.1.6.tar.gz
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.6/project-context-skill-v0.1.6.tar.gz.sha256
-3. Verify the archive with `sha256sum -c project-context-skill-v0.1.6.tar.gz.sha256` or `shasum -a 256 -c project-context-skill-v0.1.6.tar.gz.sha256`. Stop if verification fails.
-4. If `gh` already exists, also run `gh attestation verify project-context-skill-v0.1.6.tar.gz --repo k2nr/project-context-skill`. Stop if this verification fails. Do not install `gh` solely for this step; report that attestation verification was unavailable and continue with the checksum when `gh` is absent.
-5. Inspect the archive before extraction. It must contain exactly one top-level `project-context` directory, no absolute or parent-traversal paths, and no symbolic links.
-6. Extract the archive and install its `project-context` directory at `.agents/skills/project-context`. Do not install it globally.
-7. If `.agents/skills/project-context` already exists, compare it with the downloaded version. Do not overwrite or delete differing local files without asking me first.
-8. Ensure `.agents/skills/project-context/bin/project-context` is executable. Confirm that `SKILL.md`, `LICENSE`, `agents/openai.yaml`, `assets/init`, `assets/install/AGENTS.fragment.md`, and `bin/project-context` are present. The installed package must not contain Rust source, repository tests, or development artifacts.
-9. Install the managed Project Context block from `.agents/skills/project-context/assets/install/AGENTS.fragment.md` into the repository-root `AGENTS.md`. Create `AGENTS.md` when absent. When it exists without the markers, preserve all content and append the fragment. When exactly one complete marked block exists, replace only that block. Stop and ask before changing malformed, nested, or duplicate managed markers.
-10. Run a shell syntax check on `.agents/skills/project-context/bin/project-context`. Run a standard skill validator only when it already works in the environment. Do not install uv, Python packages, Cargo, or another tool solely for installation.
-11. If `.project-context` does not exist, run `.agents/skills/project-context/bin/project-context init`. If it already exists, preserve it and run `.agents/skills/project-context/bin/project-context validate`; never use `--force` automatically.
-12. Inspect the repository and update `.project-context/model.yaml` with an accurate project ID and concise description plus the real build, test, lint, and format commands. Preserve valid existing intent and history.
-13. Run `.agents/skills/project-context/bin/project-context validate --strict`. Stop and report validation errors if it fails.
-14. Report the installed version, destination, checksum result, attestation result or unavailability, AGENTS.md result, initialization or preservation result, model updates, validation result, and every file not overwritten.
+1. Work from the target repository root and inspect it to determine an accurate
+   project ID, concise description, and real build, test, lint, and format
+   commands. Explicitly identify any operation category that intentionally has
+   no command.
+2. Download these assets for tag v0.1.7 into a private temporary directory:
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.7/install-project-context-v0.1.7
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.7/install-project-context-v0.1.7.sha256
+3. Verify the installer with `sha256sum -c install-project-context-v0.1.7.sha256`
+   or `shasum -a 256 -c install-project-context-v0.1.7.sha256`. Stop if it fails.
+4. If `gh` already exists, run
+   `gh attestation verify install-project-context-v0.1.7 --repo k2nr/project-context-skill`.
+   Stop if it fails. Do not install `gh`, Python packages, Cargo, shellcheck, or
+   another tool solely for installation.
+5. Make the verified installer executable. Run it first with
+   `--dry-run --format json`, passing `--project-id`, `--description`, and repeatable
+   `--build`, `--test`, `--lint`, and `--format-command` values discovered in
+   step 1. For a legitimately empty category, pass `--allow-empty CATEGORY`.
+6. Review the JSON report. If the installer exits with status 3, stop and ask
+   before changing the reported local skill files or managed markers.
+7. Run the same verified installer command without `--dry-run`. Never add
+   `--force`; the installer preserves existing intent and history and updates
+   only explicitly supplied model fields.
+8. Report the installer and package verification, preflight availability,
+   destination, files preserved or not overwritten, AGENTS.md action,
+   initialization or preservation result, model action, doctor result, and
+   strict validation result.
 ```
+
+Example installer arguments after repository inspection:
+
+```sh
+./install-project-context-v0.1.7 \
+  --format json \
+  --project-id example-project \
+  --description 'Concise project purpose.' \
+  --build 'cargo build --locked' \
+  --test 'cargo test --locked' \
+  --lint 'cargo clippy --all-targets -- -D warnings' \
+  --format-command 'cargo fmt -- --check'
+```
+
+The installer uses a private temporary directory with cleanup traps. Before
+writing, it verifies the package checksum and available GitHub attestation,
+rejects unsafe archive paths and member types, confirms the release-only skill
+layout, compares an existing installation, and validates managed-marker shape.
+It never overwrites a differing installed skill. Exit status `3` denotes a
+local-content or managed-marker conflict that requires human direction.
+
+`--dry-run` downloads and verifies release assets but does not modify the
+repository. The JSON report includes network and repository write preflight,
+optional `gh`, `shellcheck`, and standard-validator availability, planned or
+completed actions, and validation state. Standard skill compatibility is
+validated in release CI, so target repositories do not need PyYAML.
 
 ## Expected Installed Layout
 
@@ -82,10 +115,10 @@ After installation, the target repository contains:
         └── event.schema.json
 ```
 
-The installation agent creates `.project-context/` through `project-context init`, but
-the CLI itself modifies only `.project-context/`. The agent separately maintains the
-managed `AGENTS.md` block and never replaces existing canonical data
-automatically.
+The installer creates `.project-context/` through `project-context init`. It
+uses `project-context configure` to update only explicitly supplied project and
+operation fields, then runs `project-context doctor --installation` and strict
+validation. Existing intent sections and event history are preserved.
 
 The managed block instructs compatible coding agents to load Project Context
 for non-trivial work without explicit user invocation. Skill discovery remains
@@ -105,22 +138,24 @@ binary. Cargo is not needed on target machines.
 
 ## Release Requirements
 
-Before publishing the first release:
+Before publishing a release:
 
 - Enable immutable GitHub Releases and protected release tags for `v*`.
 - Keep release tags on the repository default branch.
 - Retain full-commit-SHA pins for every GitHub Action.
 
 The release workflow verifies placeholders, repository identity, tag ancestry,
-artifact names, checksums, package contents, executable modes, and build
-provenance before publication.
+skill-contract compatibility, installer and package reproducibility, artifact
+names, checksums, package contents, executable modes, and build provenance
+before publication. The standalone installer and every package asset receive
+GitHub build-provenance attestations.
 
 ## Repository Layout
 
 ```text
 project-context/  Distributable skill files
 cli/              Rust CLI source and CLI tests
-bin/              Reproducible release packaging tools
+bin/              Secure installer, validators, and reproducible packaging tools
 tests/            Repository-level package and launcher tests
 LICENSE           Repository license
 ```

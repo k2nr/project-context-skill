@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  printf 'usage: %s SKILL_DIRECTORY\n' "$0" >&2
+  exit 2
+fi
+
+skill_directory=$1
+skill_file="${skill_directory}/SKILL.md"
+agents_file="${skill_directory}/agents/openai.yaml"
+
+[ -f "$skill_file" ] || { printf 'validate-skill: SKILL.md not found\n' >&2; exit 1; }
+[ -f "$agents_file" ] || { printf 'validate-skill: agents/openai.yaml not found\n' >&2; exit 1; }
+[ "$(sed -n '1p' "$skill_file")" = '---' ] \
+  || { printf 'validate-skill: SKILL.md has no YAML frontmatter\n' >&2; exit 1; }
+
+closing_line=$(awk 'NR > 1 && $0 == "---" { print NR; exit }' "$skill_file")
+case "$closing_line" in
+  ''|*[!0-9]*) printf 'validate-skill: invalid frontmatter delimiter\n' >&2; exit 1 ;;
+esac
+[ "$closing_line" -gt 2 ] \
+  || { printf 'validate-skill: frontmatter is empty\n' >&2; exit 1; }
+
+frontmatter=$(sed -n "2,$((closing_line - 1))p" "$skill_file")
+if printf '%s\n' "$frontmatter" | grep -Ev '^(name|description): .+$' >/dev/null; then
+  printf 'validate-skill: frontmatter must contain only one-line name and description fields\n' >&2
+  exit 1
+fi
+name_count=$(printf '%s\n' "$frontmatter" | grep -c '^name: ' || true)
+description_count=$(printf '%s\n' "$frontmatter" | grep -c '^description: ' || true)
+[ "$name_count" -eq 1 ] && [ "$description_count" -eq 1 ] \
+  || { printf 'validate-skill: name and description must appear exactly once\n' >&2; exit 1; }
+
+name=$(printf '%s\n' "$frontmatter" | sed -n 's/^name: //p')
+description=$(printf '%s\n' "$frontmatter" | sed -n 's/^description: //p')
+normalized_directory=${skill_directory%/}
+directory_name=${normalized_directory##*/}
+[ "$directory_name" = "$name" ] \
+  || { printf 'validate-skill: directory name must match the skill name\n' >&2; exit 1; }
+printf '%s\n' "$name" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$' \
+  || { printf 'validate-skill: name must use hyphen-case\n' >&2; exit 1; }
+[ "${#name}" -le 64 ] \
+  || { printf 'validate-skill: name exceeds 64 characters\n' >&2; exit 1; }
+case "$description" in
+  *'<'*|*'>'*) printf 'validate-skill: description contains an angle bracket\n' >&2; exit 1 ;;
+esac
+[ "${#description}" -le 1024 ] \
+  || { printf 'validate-skill: description exceeds 1024 characters\n' >&2; exit 1; }
+[ "$(wc -l < "$skill_file" | tr -d ' ')" -gt "$closing_line" ] \
+  || { printf 'validate-skill: SKILL.md body is empty\n' >&2; exit 1; }
+
+for field in display_name short_description default_prompt; do
+  grep -Eq "^  ${field}: \"[^\"]+\"$" "$agents_file" \
+    || { printf 'validate-skill: agents/openai.yaml is missing interface.%s\n' "$field" >&2; exit 1; }
+done
+
+printf 'skill valid\n'

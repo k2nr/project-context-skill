@@ -45,6 +45,21 @@ approximate token. Increase it if the required packet cannot fit.
    `--supersedes`, or append a new attempt under materially different
    conditions.
 
+Update discovered project identity or operation commands without rewriting
+other intent or history:
+
+```bash
+.agents/skills/project-context/bin/project-context configure \
+  --project-id example-project \
+  --description "Concise project purpose." \
+  --build "cargo build --locked" \
+  --test "cargo test --locked" \
+  --lint "cargo clippy --all-targets -- -D warnings" \
+  --format-command "cargo fmt -- --check"
+```
+
+Only supplied fields and command categories are replaced.
+
 Record a decision:
 
 ```bash
@@ -78,6 +93,18 @@ Run strict validation after updating context:
 ```bash
 .agents/skills/project-context/bin/project-context validate --strict
 ```
+
+After installation or when diagnosing installation drift, run:
+
+```bash
+.agents/skills/project-context/bin/project-context doctor --installation
+```
+
+The doctor verifies model completeness, the repository-installed skill,
+launcher syntax and mode, and the managed `AGENTS.md` block. If an operation
+category is intentionally empty, acknowledge it explicitly with, for example,
+`--allow-empty format`. Optional-tool warnings do not make the installation
+incomplete.
 
 Run the relevant build, test, lint, and format commands returned in the
 `operations` section.

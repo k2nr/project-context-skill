@@ -1,0 +1,528 @@
+#!/bin/sh
+set -eu
+
+PROJECT_CONTEXT_VERSION="0.1.7"
+PROJECT_CONTEXT_RELEASE_REPOSITORY="k2nr/project-context-skill"
+DEFAULT_RELEASE_BASE_URL="https://github.com/${PROJECT_CONTEXT_RELEASE_REPOSITORY}/releases/download"
+START_MARKER='<!-- project-context:managed:start -->'
+END_MARKER='<!-- project-context:managed:end -->'
+
+output_format=text
+dry_run=false
+project_id=
+description=
+build_commands=
+test_commands=
+lint_commands=
+format_commands=
+allowed_empty='|'
+temporary_root=
+skill_staging=
+
+json_escape() {
+  printf '%s' "$1" | awk '
+    BEGIN { first=1 }
+    {
+      gsub(/\\/, "\\\\"); gsub(/\"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r")
+      if (!first) printf "\\n"
+      printf "%s", $0
+      first=0
+    }
+  '
+}
+
+fail() {
+  message=$1
+  if [ "$output_format" = json ]; then
+    printf '{"ok":false,"error":"%s"}\n' "$(json_escape "$message")"
+  else
+    printf 'install-project-context: %s\n' "$message" >&2
+  fi
+  exit 2
+}
+
+conflict() {
+  message=$1
+  if [ "$output_format" = json ]; then
+    printf '{"ok":false,"conflict":true,"error":"%s"}\n' "$(json_escape "$message")"
+  else
+    printf 'install-project-context: %s\n' "$message" >&2
+  fi
+  exit 3
+}
+
+usage() {
+  cat <<'EOF'
+usage: install-project-context [OPTIONS]
+
+Install the verified repository-local Project Context skill in the current repository.
+
+Options:
+  --dry-run                    Verify and report without modifying the repository
+  --format text|json           Select the report format (default: text)
+  --project-id VALUE           Set project.id explicitly
+  --description VALUE          Set project.description explicitly
+  --build COMMAND              Replace build commands; repeat for multiple commands
+  --test COMMAND               Replace test commands; repeat for multiple commands
+  --lint COMMAND               Replace lint commands; repeat for multiple commands
+  --format-command COMMAND     Replace format commands; repeat for multiple commands
+  --allow-empty CATEGORY       Acknowledge empty build, test, lint, or format commands
+  --help                       Show this help
+EOF
+}
+
+append_value() {
+  current=$1
+  value=$2
+  if [ -z "$current" ]; then
+    printf '%s' "$value"
+  else
+    printf '%s\n%s' "$current" "$value"
+  fi
+}
+
+reject_multiline() {
+  label=$1
+  value=$2
+  case "$value" in
+    *'
+'*) fail "$label must not contain a newline" ;;
+  esac
+  [ -n "$value" ] || fail "$label must not be empty"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run=true; shift ;;
+    --format)
+      [ "$#" -ge 2 ] || fail "--format requires a value"
+      output_format=$2
+      case "$output_format" in text|json) ;; *) fail "--format must be text or json" ;; esac
+      shift 2
+      ;;
+    --project-id)
+      [ "$#" -ge 2 ] || fail "--project-id requires a value"
+      reject_multiline "--project-id" "$2"
+      project_id=$2
+      shift 2
+      ;;
+    --description)
+      [ "$#" -ge 2 ] || fail "--description requires a value"
+      reject_multiline "--description" "$2"
+      description=$2
+      shift 2
+      ;;
+    --build|--test|--lint|--format-command)
+      option=$1
+      [ "$#" -ge 2 ] || fail "$option requires a value"
+      reject_multiline "$option" "$2"
+      case "$option" in
+        --build) build_commands=$(append_value "$build_commands" "$2") ;;
+        --test) test_commands=$(append_value "$test_commands" "$2") ;;
+        --lint) lint_commands=$(append_value "$lint_commands" "$2") ;;
+        --format-command) format_commands=$(append_value "$format_commands" "$2") ;;
+      esac
+      shift 2
+      ;;
+    --allow-empty)
+      [ "$#" -ge 2 ] || fail "--allow-empty requires a value"
+      case "$2" in build|test|lint|format) ;; *) fail "--allow-empty must name build, test, lint, or format" ;; esac
+      case "$allowed_empty" in *"|$2|"*) ;; *) allowed_empty="${allowed_empty}$2|" ;; esac
+      shift 2
+      ;;
+    --help|-h) usage; exit 0 ;;
+    *) fail "unknown option: $1" ;;
+  esac
+done
+
+for required_command in awk cat chmod cmp cp curl diff find grep mkdir mktemp mv rm sed sh tar tr; do
+  command -v "$required_command" >/dev/null 2>&1 \
+    || fail "required command not found: $required_command"
+done
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum_command=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+  checksum_command=shasum
+else
+  fail "sha256sum or shasum is required"
+fi
+
+if command -v git >/dev/null 2>&1 \
+  && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git_root=$(git rev-parse --show-toplevel) || fail "cannot resolve the Git repository root"
+  physical_git_root=$(CDPATH= cd -- "$git_root" && pwd -P) \
+    || fail "cannot resolve the physical Git repository root"
+  [ "$(pwd -P)" = "$physical_git_root" ] || fail "run from the target repository root"
+fi
+[ ! -L .agents ] || fail ".agents must not be a symbolic link"
+[ ! -L AGENTS.md ] || fail "AGENTS.md must not be a symbolic link"
+[ ! -L .project-context ] || fail ".project-context must not be a symbolic link"
+repository_write=available
+[ -w . ] || repository_write=unavailable
+if [ "$dry_run" = false ] && [ "$repository_write" = unavailable ]; then
+  fail "repository root is not writable; grant repository-scoped write permission"
+fi
+
+gh_status=unavailable
+command -v gh >/dev/null 2>&1 && gh_status=available
+shellcheck_status=unavailable
+command -v shellcheck >/dev/null 2>&1 && shellcheck_status=available
+standard_validator_status='script not found'
+standard_validator_path=
+codex_root=${CODEX_HOME:-}
+if [ -z "$codex_root" ] && [ -n "${HOME:-}" ]; then
+  codex_root="${HOME}/.codex"
+fi
+if [ -n "$codex_root" ] \
+  && [ -f "${codex_root}/skills/.system/skill-creator/scripts/quick_validate.py" ]; then
+  standard_validator_path="${codex_root}/skills/.system/skill-creator/scripts/quick_validate.py"
+  if ! command -v python3 >/dev/null 2>&1; then
+    standard_validator_status='python3 not found'
+  elif python3 -c 'import yaml' >/dev/null 2>&1; then
+    standard_validator_status=available
+  else
+    standard_validator_status='PyYAML not found'
+  fi
+fi
+
+original_umask=$(umask)
+umask 077
+temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-install.XXXXXX") \
+  || fail "cannot create a private temporary directory"
+cleanup() {
+  status=$1
+  trap - EXIT HUP INT TERM
+  if [ -n "$skill_staging" ] && [ -d "$skill_staging" ]; then
+    rm -rf "$skill_staging"
+  fi
+  if [ -n "$temporary_root" ] && [ -d "$temporary_root" ]; then
+    rm -rf "$temporary_root"
+  fi
+  umask "$original_umask"
+  exit "$status"
+}
+trap 'cleanup $?' EXIT
+trap 'cleanup 129' HUP
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+
+release_base_url=$DEFAULT_RELEASE_BASE_URL
+if [ "${PROJECT_CONTEXT_INSTALL_TESTING:-}" = 1 ]; then
+  release_base_url=${PROJECT_CONTEXT_RELEASE_BASE_URL:-$release_base_url}
+elif [ -n "${PROJECT_CONTEXT_RELEASE_BASE_URL:-}" ] \
+  && [ "$PROJECT_CONTEXT_RELEASE_BASE_URL" != "$DEFAULT_RELEASE_BASE_URL" ]; then
+  fail "PROJECT_CONTEXT_RELEASE_BASE_URL is allowed only during installer tests"
+fi
+release_base_url=${release_base_url%/}
+case "$release_base_url" in
+  https://*) curl_protocol='=https' ;;
+  file://*)
+    [ "${PROJECT_CONTEXT_INSTALL_TESTING:-}" = 1 ] \
+      || fail "file release URLs are allowed only during installer tests"
+    curl_protocol='=https,file'
+    ;;
+  *) fail "release base URL must use HTTPS" ;;
+esac
+
+archive_name="project-context-skill-v${PROJECT_CONTEXT_VERSION}.tar.gz"
+archive="${temporary_root}/${archive_name}"
+checksum="${archive}.sha256"
+asset_base="${release_base_url}/v${PROJECT_CONTEXT_VERSION}"
+curl --fail --location --silent --show-error --retry 3 \
+  --proto "$curl_protocol" --tlsv1.2 --output "$archive" "${asset_base}/${archive_name}" \
+  || fail "cannot download ${archive_name}"
+curl --fail --location --silent --show-error --retry 3 \
+  --proto "$curl_protocol" --tlsv1.2 --output "$checksum" "${asset_base}/${archive_name}.sha256" \
+  || fail "cannot download ${archive_name}.sha256"
+network_status=available
+
+checksum_line=$(sed -n '1p' "$checksum")
+[ -n "$checksum_line" ] || fail "archive checksum file is empty"
+[ "$(awk 'END { print NR+0 }' "$checksum")" -eq 1 ] \
+  || fail "archive checksum file must contain exactly one record"
+set -f
+# Deliberately split the checksum record into its digest and file name.
+# shellcheck disable=SC2086
+set -- $checksum_line
+set +f
+[ "$#" -eq 2 ] || fail "archive checksum record has an invalid format"
+expected_checksum=$(printf '%s' "$1" | tr 'A-F' 'a-f')
+printf '%s\n' "$expected_checksum" | grep -Eq '^[0-9a-f]{64}$' \
+  || fail "archive checksum digest has an invalid format"
+checksum_file_name=$2
+case "$checksum_file_name" in "*$archive_name") checksum_file_name=${checksum_file_name#\*} ;; esac
+[ "$checksum_file_name" = "$archive_name" ] \
+  || fail "archive checksum record names an unexpected file"
+if [ "$checksum_command" = sha256sum ]; then
+  actual_checksum=$(sha256sum "$archive") || fail "cannot calculate archive SHA-256"
+else
+  actual_checksum=$(shasum -a 256 "$archive") || fail "cannot calculate archive SHA-256"
+fi
+actual_checksum=${actual_checksum%% *}
+actual_checksum=$(printf '%s' "$actual_checksum" | tr 'A-F' 'a-f')
+[ "$actual_checksum" = "$expected_checksum" ] \
+  || fail "archive SHA-256 verification failed"
+
+if [ "${PROJECT_CONTEXT_INSTALL_TESTING:-}" = 1 ]; then
+  attestation_status=skipped-testing
+elif [ "$gh_status" = available ]; then
+  gh attestation verify "$archive" --repo "$PROJECT_CONTEXT_RELEASE_REPOSITORY" \
+    > "${temporary_root}/attestation.log" 2>&1 \
+    || { sed -n '1,40p' "${temporary_root}/attestation.log" >&2; fail "GitHub artifact attestation verification failed"; }
+  attestation_status=verified
+else
+  attestation_status=unavailable
+fi
+
+tar -tzf "$archive" > "${temporary_root}/members.txt" \
+  || fail "cannot list archive members"
+tar -tvzf "$archive" > "${temporary_root}/verbose-members.txt" \
+  || fail "cannot inspect archive member types"
+grep -Fxq 'project-context/' "${temporary_root}/members.txt" \
+  || fail "archive is missing the top-level project-context directory"
+if grep -Eq '(^/|(^|/)\.\.(/|$))' "${temporary_root}/members.txt"; then
+  fail "archive contains an absolute or parent-traversal path"
+fi
+if awk -F/ '$1 != "project-context" { bad=1 } END { exit bad ? 0 : 1 }' \
+  "${temporary_root}/members.txt"; then
+  fail "archive contains an unexpected top-level entry"
+fi
+if awk '$1 !~ /^[-d]/ { bad=1 } END { exit bad ? 0 : 1 }' \
+  "${temporary_root}/verbose-members.txt"; then
+  fail "archive contains a symbolic link or unsupported member type"
+fi
+if grep -Eq '(^|/)(cli|tests?|target|\.git|\.github)(/|$)|\.rs$|/(Cargo\.(toml|lock)|rust-toolchain(\.toml)?)$' \
+  "${temporary_root}/members.txt"; then
+  fail "archive contains source, tests, or development artifacts"
+fi
+
+extract_root="${temporary_root}/extract"
+mkdir "$extract_root"
+tar -xzf "$archive" -C "$extract_root" || fail "cannot extract verified archive"
+package_root="${extract_root}/project-context"
+for required_path in SKILL.md LICENSE agents/openai.yaml assets/init assets/install/AGENTS.fragment.md bin/project-context; do
+  [ -e "${package_root}/${required_path}" ] \
+    || fail "verified package is missing ${required_path}"
+done
+find "$package_root" -type l -print -quit | grep -q . \
+  && fail "extracted package contains a symbolic link"
+chmod 755 "${package_root}/bin/project-context" \
+  || fail "cannot make the installed launcher executable"
+sh -n "${package_root}/bin/project-context" \
+  || fail "installed launcher failed the shell syntax check"
+if [ "$standard_validator_status" = available ]; then
+  python3 "$standard_validator_path" "$package_root" \
+    > "${temporary_root}/standard-validator.log" 2>&1 \
+    || { sed -n '1,80p' "${temporary_root}/standard-validator.log" >&2; fail "standard skill validation failed"; }
+  target_skill_validation=passed
+else
+  target_skill_validation=release-ci-only
+fi
+
+destination=.agents/skills/project-context
+skill_action=installed
+if [ -L "$destination" ]; then
+  conflict "$destination is a symbolic link and was not overwritten"
+elif [ -e "$destination" ]; then
+  if diff -qr "$destination" "$package_root" > "${temporary_root}/skill.diff" 2>&1; then
+    skill_action=preserved-identical
+  else
+    sed -n '1,80p' "${temporary_root}/skill.diff" >&2
+    conflict "$destination differs from v${PROJECT_CONTEXT_VERSION} and was not overwritten"
+  fi
+fi
+
+fragment="${package_root}/assets/install/AGENTS.fragment.md"
+agents_action=created
+agents_next="${temporary_root}/AGENTS.md.next"
+if [ -e AGENTS.md ]; then
+  [ -f AGENTS.md ] || conflict "AGENTS.md is not a regular file and was not overwritten"
+  start_count=$(awk -v marker="$START_MARKER" '{ line=$0; while ((position=index(line, marker)) > 0) { count++; line=substr(line, position + length(marker)) } } END { print count+0 }' AGENTS.md)
+  end_count=$(awk -v marker="$END_MARKER" '{ line=$0; while ((position=index(line, marker)) > 0) { count++; line=substr(line, position + length(marker)) } } END { print count+0 }' AGENTS.md)
+  if [ "$start_count" -eq 0 ] && [ "$end_count" -eq 0 ]; then
+    agents_action=appended
+    cp -p AGENTS.md "$agents_next"
+    printf '\n' >> "$agents_next"
+    cat "$fragment" >> "$agents_next"
+  elif [ "$start_count" -eq 1 ] && [ "$end_count" -eq 1 ] \
+    && grep -Fxq "$START_MARKER" AGENTS.md \
+    && grep -Fxq "$END_MARKER" AGENTS.md \
+    && awk -v start="$START_MARKER" -v end="$END_MARKER" '
+      $0 == start { if (open || complete) exit 1; open=1; next }
+      $0 == end { if (!open) exit 1; open=0; complete=1; next }
+      END { exit (!complete || open) ? 1 : 0 }
+    ' AGENTS.md; then
+    agents_action=replaced
+    cp -p AGENTS.md "$agents_next"
+    awk -v start="$START_MARKER" -v end="$END_MARKER" '
+      NR == FNR { fragment = fragment $0 ORS; next }
+      $0 == start { printf "%s", fragment; replacing=1; next }
+      replacing && $0 == end { replacing=0; next }
+      !replacing { print }
+    ' "$fragment" AGENTS.md > "${temporary_root}/AGENTS.md.content"
+    cat "${temporary_root}/AGENTS.md.content" > "$agents_next"
+  else
+    conflict "AGENTS.md has malformed, nested, or duplicate managed markers and was not changed"
+  fi
+else
+  cp "$fragment" "$agents_next"
+fi
+
+context_exists=false
+[ -e .project-context ] && context_exists=true
+if [ "$context_exists" = false ]; then
+  [ -n "$project_id" ] || fail "--project-id is required when initializing a new repository"
+  [ -n "$description" ] || fail "--description is required when initializing a new repository"
+  for operation in build test lint format; do
+    case "$operation" in
+      build) commands=$build_commands ;;
+      test) commands=$test_commands ;;
+      lint) commands=$lint_commands ;;
+      format) commands=$format_commands ;;
+    esac
+    case "$allowed_empty" in *"|${operation}|"*) allowed=true ;; *) allowed=false ;; esac
+    if [ -z "$commands" ] && [ "$allowed" = false ]; then
+      fail "provide --${operation} commands or acknowledge --allow-empty ${operation}"
+    fi
+  done
+  context_preflight=not-applicable
+else
+  staged_launcher="${package_root}/bin/project-context"
+  if [ "${PROJECT_CONTEXT_INSTALL_TESTING:-}" = 1 ]; then
+    PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
+    PROJECT_CONTEXT_RELEASE_BASE_URL="$release_base_url" \
+    PROJECT_CONTEXT_CACHE_DIR="${temporary_root}/cli-cache" \
+      "$staged_launcher" validate > "${temporary_root}/validate-preflight.log" 2>&1 \
+      || { sed -n '1,80p' "${temporary_root}/validate-preflight.log" >&2; fail "existing .project-context failed preflight validation and was preserved"; }
+  else
+    "$staged_launcher" validate > "${temporary_root}/validate-preflight.log" 2>&1 \
+      || { sed -n '1,80p' "${temporary_root}/validate-preflight.log" >&2; fail "existing .project-context failed preflight validation and was preserved"; }
+  fi
+  context_preflight=validated
+fi
+
+if [ "$dry_run" = true ]; then
+  context_action=planned
+  model_action=planned
+  validation_status=not-run
+else
+  if [ "$skill_action" = installed ]; then
+    mkdir -p .agents/skills || fail "cannot create .agents/skills"
+    [ ! -L .agents/skills ] || fail ".agents/skills must not be a symbolic link"
+    skill_staging=".agents/skills/.project-context.install.$$"
+    [ ! -e "$skill_staging" ] || fail "skill installation staging path already exists"
+    cp -R "$package_root" "$skill_staging" || fail "cannot stage the installed skill"
+    chmod 755 "${skill_staging}/bin/project-context" \
+      || fail "cannot set the staged launcher executable"
+    mv "$skill_staging" "$destination" || fail "cannot publish the installed skill"
+    skill_staging=
+  fi
+  mv "$agents_next" AGENTS.md || fail "cannot publish the managed AGENTS.md block"
+
+  launcher="${destination}/bin/project-context"
+  run_launcher() {
+    if [ "${PROJECT_CONTEXT_INSTALL_TESTING:-}" = 1 ]; then
+      PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
+      PROJECT_CONTEXT_RELEASE_BASE_URL="$release_base_url" \
+      PROJECT_CONTEXT_CACHE_DIR="${temporary_root}/cli-cache" \
+        "$launcher" "$@"
+    else
+      "$launcher" "$@"
+    fi
+  }
+
+  if [ "$context_exists" = true ]; then
+    run_launcher validate > "${temporary_root}/validate-before.log" 2>&1 \
+      || { sed -n '1,80p' "${temporary_root}/validate-before.log" >&2; fail "existing .project-context failed validation and was preserved"; }
+    context_action=preserved
+  else
+    run_launcher init > "${temporary_root}/init.log" 2>&1 \
+      || { sed -n '1,80p' "${temporary_root}/init.log" >&2; fail "cannot initialize .project-context"; }
+    context_action=initialized
+  fi
+
+  set -- configure --format json
+  [ -z "$project_id" ] || set -- "$@" --project-id "$project_id"
+  [ -z "$description" ] || set -- "$@" --description "$description"
+  for specification in "build:$build_commands" "test:$test_commands" "lint:$lint_commands" "format-command:$format_commands"; do
+    option=${specification%%:*}
+    commands=${specification#*:}
+    if [ -n "$commands" ]; then
+      printf '%s\n' "$commands" > "${temporary_root}/${option}.commands"
+      while IFS= read -r command; do
+        set -- "$@" "--${option}" "$command"
+      done < "${temporary_root}/${option}.commands"
+    fi
+  done
+  if [ "$#" -gt 3 ]; then
+    run_launcher "$@" > "${temporary_root}/configure.log" 2>&1 \
+      || { sed -n '1,80p' "${temporary_root}/configure.log" >&2; fail "cannot configure model.yaml"; }
+    model_action=updated-explicit-fields
+  else
+    model_action=preserved
+  fi
+
+  set -- doctor --installation --format json
+  for operation in build test lint format; do
+    case "$allowed_empty" in *"|${operation}|"*) set -- "$@" --allow-empty "$operation" ;; esac
+  done
+  run_launcher "$@" > "${temporary_root}/doctor.log" 2>&1 \
+    || { sed -n '1,160p' "${temporary_root}/doctor.log" >&2; fail "installation doctor reported incomplete configuration"; }
+  run_launcher validate --strict > "${temporary_root}/validate-strict.log" 2>&1 \
+    || { sed -n '1,120p' "${temporary_root}/validate-strict.log" >&2; fail "strict validation failed"; }
+  validation_status=passed
+fi
+
+if [ "$output_format" = json ]; then
+  preserved=
+  [ "$skill_action" = preserved-identical ] && preserved='".agents/skills/project-context"'
+  if [ "$context_action" = preserved ]; then
+    [ -z "$preserved" ] || preserved="${preserved},"
+    preserved="${preserved}\".project-context\""
+  fi
+  if [ "$model_action" = preserved ]; then
+    [ -z "$preserved" ] || preserved="${preserved},"
+    preserved="${preserved}\".project-context/model.yaml\""
+  fi
+  printf '{\n'
+  printf '  "ok": true,\n'
+  printf '  "version": "%s",\n' "$PROJECT_CONTEXT_VERSION"
+  printf '  "destination": "%s",\n' "$destination"
+  printf '  "dry_run": %s,\n' "$dry_run"
+  printf '  "verification": {"checksum":"verified","attestation":"%s","archive":"verified","release_skill_validation":"passed"},\n' "$attestation_status"
+  printf '  "preflight": {"network":"%s","repository_write":"%s","gh":"%s","shellcheck":"%s","standard_skill_validator":"%s"},\n' \
+    "$network_status" "$repository_write" "$gh_status" "$shellcheck_status" "$(json_escape "$standard_validator_status")"
+  printf '  "context_preflight": "%s",\n' "$context_preflight"
+  printf '  "target_skill_validation": "%s",\n' "$target_skill_validation"
+  printf '  "actions": {"skill":"%s","agents":"%s","context":"%s","model":"%s"},\n' \
+    "$skill_action" "$agents_action" "$context_action" "$model_action"
+  printf '  "preserved_not_overwritten": [%s],\n' "$preserved"
+  printf '  "validation": "%s"\n' "$validation_status"
+  printf '}\n'
+else
+  completion_label=complete
+  [ "$dry_run" = false ] || completion_label='dry run'
+  printf 'Project Context v%s installation %s\n' "$PROJECT_CONTEXT_VERSION" "$completion_label"
+  printf 'checksum: verified\n'
+  printf 'attestation: %s\n' "$attestation_status"
+  printf 'archive: verified\n'
+  printf 'release skill validation: passed\n'
+  printf 'target standard skill validation: %s\n' "$target_skill_validation"
+  printf 'preflight: network=%s repository-write=%s gh=%s shellcheck=%s standard-validator=%s\n' \
+    "$network_status" "$repository_write" "$gh_status" "$shellcheck_status" "$standard_validator_status"
+  printf 'context preflight: %s\n' "$context_preflight"
+  printf 'skill: %s (%s)\n' "$skill_action" "$destination"
+  printf 'AGENTS.md: %s\n' "$agents_action"
+  printf '.project-context: %s\n' "$context_action"
+  printf 'model.yaml: %s\n' "$model_action"
+  if [ "$skill_action" = preserved-identical ]; then
+    printf 'preserved, not overwritten: .agents/skills/project-context\n'
+  fi
+  if [ "$context_action" = preserved ]; then
+    printf 'preserved, not overwritten: .project-context\n'
+  fi
+  if [ "$model_action" = preserved ]; then
+    printf 'preserved, not overwritten: .project-context/model.yaml\n'
+  fi
+  printf 'strict validation: %s\n' "$validation_status"
+fi

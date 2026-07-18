@@ -1,5 +1,6 @@
 use crate::context::ContextPacket;
-use crate::store::{InitReport, ValidationReport};
+use crate::doctor::DoctorReport;
+use crate::store::{ConfigureReport, InitReport, ValidationReport};
 use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
@@ -14,6 +15,46 @@ pub enum OutputFormat {
 pub fn render_init(report: &InitReport, format: OutputFormat) -> String {
     match format {
         OutputFormat::Text => format!("initialized\n{}", report.files.join("\n")),
+        _ => render_serializable(report, format),
+    }
+}
+
+pub fn render_configure(report: &ConfigureReport, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Text => {
+            if report.updated.is_empty() {
+                "configuration unchanged".to_owned()
+            } else {
+                format!("configured\n{}", report.updated.join("\n"))
+            }
+        }
+        _ => render_serializable(report, format),
+    }
+}
+
+pub fn render_doctor(report: &DoctorReport, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Text => {
+            let mut lines = vec![if report.ready {
+                "installation ready".to_owned()
+            } else {
+                "installation incomplete".to_owned()
+            }];
+            lines.extend(
+                report
+                    .checks
+                    .iter()
+                    .map(|(check, status)| format!("check: {check}: {status}")),
+            );
+            lines.extend(report.errors.iter().map(|error| format!("error: {error}")));
+            lines.extend(
+                report
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("warning: {warning}")),
+            );
+            lines.join("\n")
+        }
         _ => render_serializable(report, format),
     }
 }

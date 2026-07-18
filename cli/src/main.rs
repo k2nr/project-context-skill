@@ -1,9 +1,13 @@
 mod context;
+mod doctor;
 mod output;
 mod store;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use output::{OutputFormat, render_context, render_event, render_init, render_validation};
+use output::{
+    OutputFormat, render_configure, render_context, render_doctor, render_event, render_init,
+    render_validation,
+};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -26,6 +30,21 @@ enum Command {
         /// Replace existing project-context files.
         #[arg(long)]
         force: bool,
+    },
+    /// Update explicitly supplied project identity and operation commands.
+    Configure {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        build: Vec<String>,
+        #[arg(long)]
+        test: Vec<String>,
+        #[arg(long)]
+        lint: Vec<String>,
+        #[arg(long)]
+        format_command: Vec<String>,
     },
     /// Return relevant durable context for paths, symbols, phrases, or topics.
     Context {
@@ -82,6 +101,34 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
+    /// Diagnose whether a repository-local installation is complete and usable.
+    Doctor {
+        /// Check the installed skill, managed AGENTS block, and populated model.
+        #[arg(long)]
+        installation: bool,
+        /// Acknowledge an operation category that intentionally has no commands.
+        #[arg(long, value_enum)]
+        allow_empty: Vec<OperationKind>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
+enum OperationKind {
+    Build,
+    Test,
+    Lint,
+    Format,
+}
+
+impl OperationKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Test => "test",
+            Self::Lint => "lint",
+            Self::Format => "format",
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -105,6 +152,7 @@ impl AttemptResult {
 
 enum AppError {
     Invalid(store::ValidationReport),
+    Doctor(doctor::DoctorReport),
     Environment(String),
 }
 
@@ -122,6 +170,7 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(output) => write_stdout(&output, 0),
         Err(AppError::Invalid(report)) => write_stdout(&render_validation(&report, cli.format), 1),
+        Err(AppError::Doctor(report)) => write_stdout(&render_doctor(&report, cli.format), 1),
         Err(AppError::Environment(message)) => {
             eprintln!("error: {message}");
             ExitCode::from(2)
@@ -135,6 +184,34 @@ fn run(cli: &Cli) -> Result<String, AppError> {
             let root = current_directory()?;
             let report = store::initialize(&root, *force).map_err(AppError::Environment)?;
             Ok(render_init(&report, cli.format))
+        }
+        Command::Configure {
+            project_id,
+            description,
+            build,
+            test,
+            lint,
+            format_command,
+        } => {
+            validate_optional_value("--project-id", project_id.as_deref())?;
+            validate_optional_value("--description", description.as_deref())?;
+            validate_commands("--build", build)?;
+            validate_commands("--test", test)?;
+            validate_commands("--lint", lint)?;
+            validate_commands("--format-command", format_command)?;
+            let root = nearest_root()?;
+            let report = store::configure(
+                &root,
+                store::ConfigureInput {
+                    project_id: project_id.clone(),
+                    description: description.clone(),
+                    build: build.clone(),
+                    test: test.clone(),
+                    lint: lint.clone(),
+                    format: format_command.clone(),
+                },
+            )?;
+            Ok(render_configure(&report, cli.format))
         }
         Command::Context {
             queries,
@@ -238,7 +315,45 @@ fn run(cli: &Cli) -> Result<String, AppError> {
                 Err(AppError::Invalid(report))
             }
         }
+        Command::Doctor {
+            installation,
+            allow_empty,
+        } => {
+            if !installation {
+                return Err(AppError::Environment(
+                    "doctor currently requires --installation".to_owned(),
+                ));
+            }
+            let root = nearest_root()?;
+            let allowed = allow_empty
+                .iter()
+                .map(|operation| operation.as_str())
+                .collect();
+            let report =
+                doctor::inspect_installation(&root, &allowed).map_err(AppError::Environment)?;
+            if report.ready {
+                Ok(render_doctor(&report, cli.format))
+            } else {
+                Err(AppError::Doctor(report))
+            }
+        }
     }
+}
+
+fn validate_optional_value(label: &str, value: Option<&str>) -> Result<(), AppError> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(AppError::Environment(format!("{label} must not be empty")));
+    }
+    Ok(())
+}
+
+fn validate_commands(label: &str, commands: &[String]) -> Result<(), AppError> {
+    if commands.iter().any(|command| command.trim().is_empty()) {
+        return Err(AppError::Environment(format!(
+            "{label} command must not be empty"
+        )));
+    }
+    Ok(())
 }
 
 fn write_stdout(output: &str, successful_write_code: u8) -> ExitCode {

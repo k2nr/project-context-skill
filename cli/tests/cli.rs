@@ -17,6 +17,33 @@ fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("UTF-8 stdout")
 }
 
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create destination directory");
+    for entry in fs::read_dir(source).expect("read source directory") {
+        let entry = entry.expect("source entry");
+        let target = destination.join(entry.file_name());
+        if entry.file_type().expect("entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy source file");
+        }
+    }
+}
+
+fn install_skill_fixture(root: &Path) {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repository root");
+    let destination = root.join(".agents/skills/project-context");
+    copy_tree(&repository.join("project-context"), &destination);
+    fs::copy(repository.join("LICENSE"), destination.join("LICENSE")).expect("copy license");
+    fs::copy(
+        destination.join("assets/install/AGENTS.fragment.md"),
+        root.join("AGENTS.md"),
+    )
+    .expect("copy managed AGENTS block");
+}
+
 #[test]
 fn all_phase_four_commands_work_end_to_end() {
     let directory = TempDir::new().expect("temporary directory");
@@ -87,6 +114,127 @@ fn all_phase_four_commands_work_end_to_end() {
     let validate = cli(directory.path(), &["validate", "--format", "text"]);
     assert!(validate.status.success(), "{}", stdout(&validate));
     assert_eq!(stdout(&validate), "valid\n");
+}
+
+#[test]
+fn configure_updates_only_explicit_model_fields_and_preserves_history() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    assert!(
+        cli(
+            directory.path(),
+            &[
+                "add-attempt",
+                "--subject",
+                "preserved history",
+                "--approach",
+                "Record before configuration.",
+                "--result",
+                "succeeded",
+                "--finding",
+                "Configuration preserves the event log.",
+            ],
+        )
+        .status
+        .success()
+    );
+    let events_path = directory.path().join(".project-context/events.jsonl");
+    let events_before = fs::read(&events_path).expect("events before configuration");
+
+    let configured = cli(
+        directory.path(),
+        &[
+            "configure",
+            "--project-id",
+            "configured-project",
+            "--description",
+            "Configured project fixture.",
+            "--build",
+            "cargo build",
+            "--test",
+            "cargo test",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(configured.status.success(), "{}", stdout(&configured));
+    let report: Value = serde_json::from_slice(&configured.stdout).expect("configure JSON");
+    assert_eq!(report["updated"].as_array().expect("updated").len(), 4);
+    assert_eq!(
+        fs::read(events_path).expect("events after configuration"),
+        events_before
+    );
+    let model = fs::read_to_string(directory.path().join(".project-context/model.yaml"))
+        .expect("configured model");
+    assert!(model.contains("id: configured-project"));
+    assert!(model.contains("description: Configured project fixture."));
+    assert!(model.contains("cargo build"));
+    assert!(model.contains("cargo test"));
+    assert!(
+        cli(directory.path(), &["validate", "--strict"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn installation_doctor_requires_complete_model_or_explicit_empty_acknowledgement() {
+    let directory = TempDir::new().expect("temporary directory");
+    install_skill_fixture(directory.path());
+    assert!(cli(directory.path(), &["init"]).status.success());
+    assert!(
+        cli(
+            directory.path(),
+            &[
+                "configure",
+                "--description",
+                "Doctor fixture.",
+                "--build",
+                "cargo build",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let incomplete = cli(
+        directory.path(),
+        &["doctor", "--installation", "--format", "json"],
+    );
+    assert_eq!(incomplete.status.code(), Some(1));
+    let incomplete_report: Value =
+        serde_json::from_slice(&incomplete.stdout).expect("incomplete doctor JSON");
+    assert_eq!(incomplete_report["ready"], false);
+    assert!(
+        incomplete_report["errors"]
+            .as_array()
+            .expect("doctor errors")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .is_some_and(|error| error.contains("operations.test")))
+    );
+
+    let ready = cli(
+        directory.path(),
+        &[
+            "doctor",
+            "--installation",
+            "--allow-empty",
+            "test",
+            "--allow-empty",
+            "lint",
+            "--allow-empty",
+            "format",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(ready.status.success(), "{}", stdout(&ready));
+    let ready_report: Value = serde_json::from_slice(&ready.stdout).expect("ready doctor JSON");
+    assert_eq!(ready_report["ready"], true);
+    assert_eq!(ready_report["checks"]["skill.package"], "valid");
+    assert_eq!(ready_report["checks"]["agents.managed_block"], "current");
 }
 
 #[test]
