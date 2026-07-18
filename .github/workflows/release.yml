@@ -73,8 +73,8 @@ jobs:
           identity=$(file "$binary")
           printf '%s\n' "$identity"
           case "${{ matrix.target }}" in
-            x86_64-*) grep -Eq 'x86[-_]64|x86-64' <<<"$identity" ;;
-            aarch64-*) grep -Eq 'aarch64|ARM64' <<<"$identity" ;;
+            x86_64-*) printf '%s\n' "$identity" | grep -Eq 'x86[-_]64|x86-64' ;;
+            aarch64-*) printf '%s\n' "$identity" | grep -Eq 'aarch64|ARM64' ;;
           esac
           "$binary" --version
           tests/test-bootstrap.sh project-context/bin/project-context
@@ -117,8 +117,8 @@ jobs:
           identity=$(file "$binary")
           printf '%s\n' "$identity"
           case "${{ matrix.target }}" in
-            x86_64-*) grep -Eq 'x86_64|x86-64' <<<"$identity" ;;
-            aarch64-*) grep -Eq 'arm64|ARM64' <<<"$identity" ;;
+            x86_64-*) printf '%s\n' "$identity" | grep -Eq 'x86_64|x86-64' ;;
+            aarch64-*) printf '%s\n' "$identity" | grep -Eq 'arm64|ARM64' ;;
           esac
           "$binary" --version
           tests/test-bootstrap.sh project-context/bin/project-context

@@ -46,11 +46,19 @@ manifest="${temporary_root}/manifest.txt"
 archive_name="project-context-skill-v${version}.tar.gz"
 uncompressed="${temporary_root}/${archive_name%.gz}"
 archive="${temporary_root}/${archive_name}"
-(
-  cd "${temporary_root}/skill-package"
-  COPYFILE_DISABLE=1 tar --no-recursion --no-xattrs --uid 0 --gid 0 --uname root --gname root \
-    -cf "$uncompressed" -T "$manifest"
-)
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  (
+    cd "${temporary_root}/skill-package"
+    tar --no-recursion --no-xattrs --owner=0 --group=0 --numeric-owner \
+      -cf "$uncompressed" -T "$manifest"
+  )
+else
+  (
+    cd "${temporary_root}/skill-package"
+    COPYFILE_DISABLE=1 tar --no-recursion --no-xattrs --uid 0 --gid 0 --uname root --gname root \
+      -cf "$uncompressed" -T "$manifest"
+  )
+fi
 gzip -n -c "$uncompressed" > "$archive"
 
 mkdir -p "$output_directory"
