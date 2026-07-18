@@ -1,0 +1,203 @@
+name: Release project-context
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Test CLI
+        run: cargo test --locked --manifest-path cli/Cargo.toml
+      - name: Lint CLI
+        run: cargo clippy --locked --manifest-path cli/Cargo.toml --all-targets -- -D warnings
+      - name: Check formatting
+        run: cargo fmt --manifest-path cli/Cargo.toml -- --check
+      - name: Audit Rust dependencies
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ github.token }}
+          working-directory: cli
+      - name: Check shell files
+        run: |
+          shellcheck project-context/bin/project-context bin/package-skill tests/*.sh
+          sh -n project-context/bin/project-context
+          sh -n bin/package-skill
+          for test_file in tests/*.sh; do sh -n "${test_file}"; done
+      - name: Check workflow syntax
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          "$(go env GOPATH)/bin/actionlint" .github/workflows/release.yml
+      - name: Test launcher and package
+        run: |
+          tests/test-bootstrap.sh project-context/bin/project-context
+          tests/test-package.sh
+
+  build-linux:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rust:1.95.0-slim-bullseye@sha256:a9bd605cd31827c6c20d145d7ba0c0c5ec66827ad26894a8f07d5575f3110c1d
+    steps:
+      - name: Install build utilities
+        run: apt-get update && apt-get install --yes ca-certificates curl file git
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Build release binary
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --locked --release --target "${{ matrix.target }}" --manifest-path cli/Cargo.toml
+      - name: Smoke test release binary
+        run: |
+          binary="cli/target/${{ matrix.target }}/release/project-context"
+          identity=$(file "$binary")
+          printf '%s\n' "$identity"
+          case "${{ matrix.target }}" in
+            x86_64-*) grep -Eq 'x86[-_]64|x86-64' <<<"$identity" ;;
+            aarch64-*) grep -Eq 'aarch64|ARM64' <<<"$identity" ;;
+          esac
+          "$binary" --version
+          tests/test-bootstrap.sh project-context/bin/project-context
+      - name: Prepare release assets
+        run: |
+          asset="project-context-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p release-assets
+          cp "cli/target/${{ matrix.target }}/release/project-context" "release-assets/${asset}"
+          (cd release-assets && sha256sum "${asset}" > "${asset}.sha256")
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: binary-${{ matrix.target }}
+          path: release-assets/
+          if-no-files-found: error
+
+  build-macos:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Build release binary
+        run: |
+          rustup target add "${{ matrix.target }}"
+          cargo build --locked --release --target "${{ matrix.target }}" --manifest-path cli/Cargo.toml
+      - name: Smoke test release binary
+        run: |
+          binary="cli/target/${{ matrix.target }}/release/project-context"
+          identity=$(file "$binary")
+          printf '%s\n' "$identity"
+          case "${{ matrix.target }}" in
+            x86_64-*) grep -Eq 'x86_64|x86-64' <<<"$identity" ;;
+            aarch64-*) grep -Eq 'arm64|ARM64' <<<"$identity" ;;
+          esac
+          "$binary" --version
+          tests/test-bootstrap.sh project-context/bin/project-context
+      - name: Prepare release assets
+        run: |
+          asset="project-context-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p release-assets
+          cp "cli/target/${{ matrix.target }}/release/project-context" "release-assets/${asset}"
+          (cd release-assets && shasum -a 256 "${asset}" > "${asset}.sha256")
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: binary-${{ matrix.target }}
+          path: release-assets/
+          if-no-files-found: error
+
+  release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify release identity and tag
+        shell: bash
+        run: |
+          package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml | head -n 1)
+          launcher_version=$(sed -n 's/^PROJECT_CONTEXT_VERSION="\([^"]*\)"/\1/p' project-context/bin/project-context | head -n 1)
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
+          test "${package_version}" = "${launcher_version}"
+          test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
+          remote_tag_sha=$(git ls-remote origin "refs/tags/${GITHUB_REF_NAME}^{}" | awk 'NR == 1 { print $1 }')
+          if test -z "${remote_tag_sha}"; then
+            remote_tag_sha=$(git ls-remote origin "refs/tags/${GITHUB_REF_NAME}" | awk 'NR == 1 { print $1 }')
+          fi
+          test "${remote_tag_sha}" = "${GITHUB_SHA}"
+          default_branch="${{ github.event.repository.default_branch }}"
+          git fetch --no-tags origin "${default_branch}"
+          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${default_branch}"
+          ! grep -R -E 'PENDING_GITHUB_REPOSITORY|OWNER/REPOSITORY' README.md project-context
+          grep -Fq "PROJECT_CONTEXT_RELEASE_REPOSITORY=\"${GITHUB_REPOSITORY}\"" project-context/bin/project-context
+          grep -Fq "github.com/${GITHUB_REPOSITORY}" README.md
+      - name: Package project-installed skill
+        run: bin/package-skill "${GITHUB_REF_NAME#v}" release-assets
+      - name: Verify release assets
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          cat > expected-assets.txt <<EOF
+          project-context-${version}-aarch64-apple-darwin
+          project-context-${version}-aarch64-apple-darwin.sha256
+          project-context-${version}-aarch64-unknown-linux-gnu
+          project-context-${version}-aarch64-unknown-linux-gnu.sha256
+          project-context-${version}-x86_64-apple-darwin
+          project-context-${version}-x86_64-apple-darwin.sha256
+          project-context-${version}-x86_64-unknown-linux-gnu
+          project-context-${version}-x86_64-unknown-linux-gnu.sha256
+          project-context-skill-${version}.tar.gz
+          project-context-skill-${version}.tar.gz.sha256
+          EOF
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > actual-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+          (cd release-assets && sha256sum --check ./*.sha256)
+          tests/test-package.sh release-assets/project-context-skill-${version}.tar.gz
+      - name: Attest release assets
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: release-assets/*
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" release-assets/* --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"

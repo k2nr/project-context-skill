@@ -1,0 +1,19 @@
+schema_version: 1
+
+project:
+  id: example-project
+  description: >
+    Replace this text with a concise description of the project's purpose.
+
+principles: []
+architecture: []
+behaviors: []
+constraints: []
+
+operations:
+  build: []
+  test: []
+  lint: []
+  format: []
+
+extensions: {}

@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  printf 'usage: %s VERSION OUTPUT_DIRECTORY\n' "$0" >&2
+  exit 2
+fi
+
+version=$1
+output_directory=$2
+case "$version" in
+  ''|*[!0-9.]*)
+    printf 'package-skill: invalid version: %s\n' "$version" >&2
+    exit 2
+    ;;
+esac
+
+script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repository_root=$(CDPATH= cd -- "${script_directory}/.." && pwd)
+temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-package.XXXXXX")
+trap 'rm -rf "$temporary_root"' EXIT HUP INT TERM
+
+package_root="${temporary_root}/skill-package/project-context"
+mkdir -p "${package_root}/bin"
+cp "${repository_root}/project-context/SKILL.md" "${repository_root}/LICENSE" "$package_root/"
+cp -R "${repository_root}/project-context/agents" "$package_root/"
+cp -R "${repository_root}/project-context/assets" "$package_root/"
+cp "${repository_root}/project-context/bin/project-context" "${package_root}/bin/"
+chmod 755 "${package_root}/bin/project-context"
+
+find "${temporary_root}/skill-package/project-context" -exec touch -t 197001010000 {} +
+manifest="${temporary_root}/manifest.txt"
+(
+  cd "${temporary_root}/skill-package"
+  LC_ALL=C find project-context -print | LC_ALL=C sort > "$manifest"
+)
+
+archive_name="project-context-skill-v${version}.tar.gz"
+uncompressed="${temporary_root}/${archive_name%.gz}"
+archive="${temporary_root}/${archive_name}"
+(
+  cd "${temporary_root}/skill-package"
+  COPYFILE_DISABLE=1 tar --no-recursion --no-xattrs --uid 0 --gid 0 --uname root --gname root \
+    -cf "$uncompressed" -T "$manifest"
+)
+gzip -n -c "$uncompressed" > "$archive"
+
+mkdir -p "$output_directory"
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum=$(sha256sum "$archive")
+  checksum=${checksum%% *}
+else
+  checksum=$(shasum -a 256 "$archive")
+  checksum=${checksum%% *}
+fi
+printf '%s  %s\n' "$checksum" "$archive_name" > "${archive}.sha256"
+mv "$archive" "${output_directory}/${archive_name}"
+mv "${archive}.sha256" "${output_directory}/${archive_name}.sha256"
+
+printf '%s\n' "${output_directory}/${archive_name}"

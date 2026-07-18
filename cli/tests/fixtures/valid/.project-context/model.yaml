@@ -1,0 +1,31 @@
+schema_version: 1
+project:
+  id: fixture-project
+  description: A complete valid fixture.
+principles:
+  - id: preserve-intent
+    statement: Preserve user intent over incidental implementation detail.
+architecture:
+  - id: process-boundary
+    statement: The frontend owns interactive state.
+    related_events:
+      - D-1
+behaviors:
+  - id: stable-output
+    statement: Equivalent inputs produce stable output.
+constraints:
+  - id: stable-order
+    statement: Item ordering remains stable across process boundaries.
+    related_events:
+      - D-2
+      - A-1
+operations:
+  build:
+    - cargo build
+  test:
+    - cargo test
+  lint:
+    - cargo clippy --all-targets -- -D warnings
+  format:
+    - cargo fmt --check
+extensions: {}

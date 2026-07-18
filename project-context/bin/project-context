@@ -1,0 +1,273 @@
+#!/bin/sh
+set -eu
+
+PROJECT_CONTEXT_VERSION="0.1.0"
+PROJECT_CONTEXT_RELEASE_REPOSITORY="PENDING_GITHUB_REPOSITORY"
+DEFAULT_RELEASE_BASE_URL="https://github.com/${PROJECT_CONTEXT_RELEASE_REPOSITORY}/releases/download"
+
+fail() {
+  printf 'project-context: %s\n' "$1" >&2
+  exit 2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+sha256() {
+  checksum_file=$1
+  if command -v sha256sum >/dev/null 2>&1; then
+    checksum_output=$(sha256sum "$checksum_file") || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    checksum_output=$(shasum -a 256 "$checksum_file") || return 1
+  else
+    return 1
+  fi
+  checksum_value=${checksum_output%% *}
+  [ -n "$checksum_value" ] || return 1
+  printf '%s\n' "$checksum_value"
+}
+
+normalize_checksum() {
+  normalized_checksum=$(printf '%s' "$1" | tr 'A-F' 'a-f') || return 1
+  printf '%s\n' "$normalized_checksum" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  printf '%s\n' "$normalized_checksum"
+}
+
+checksum_from_line() {
+  checksum_line=$1
+  # shellcheck disable=SC2086 # Deliberately split one checksum-file line.
+  set -- $checksum_line
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || return 1
+  normalize_checksum "$1"
+}
+
+detect_target() {
+  system_name=$(uname -s) || fail "cannot detect the operating system"
+  machine_name=$(uname -m) || fail "cannot detect the machine architecture"
+
+  case "$system_name" in
+    Darwin)
+      target_system="apple-darwin"
+      ;;
+    Linux)
+      if ! command -v getconf >/dev/null 2>&1; then
+        fail "unsupported Linux libc: GNU libc 2.31 or newer is required"
+      fi
+      libc_description=$(getconf GNU_LIBC_VERSION 2>/dev/null) \
+        || fail "unsupported Linux libc: musl and Alpine are not supported"
+      libc_version=${libc_description#glibc }
+      libc_major=${libc_version%%.*}
+      libc_minor=${libc_version#*.}
+      libc_minor=${libc_minor%%.*}
+      case "$libc_major:$libc_minor" in
+        *[!0-9:]*|:*) fail "cannot determine the GNU libc version" ;;
+      esac
+      if [ "$libc_major" -lt 2 ] \
+        || { [ "$libc_major" -eq 2 ] && [ "$libc_minor" -lt 31 ]; }; then
+        fail "unsupported GNU libc ${libc_version}: version 2.31 or newer is required"
+      fi
+      target_system="unknown-linux-gnu"
+      ;;
+    *) fail "unsupported operating system: $system_name" ;;
+  esac
+
+  case "$machine_name" in
+    x86_64|amd64) target_arch="x86_64" ;;
+    arm64|aarch64) target_arch="aarch64" ;;
+    *) fail "unsupported architecture: $machine_name" ;;
+  esac
+
+  printf '%s-%s\n' "$target_arch" "$target_system"
+}
+
+download() {
+  source_url=$1
+  destination=$2
+  case "$source_url" in
+    https://*) ;;
+    file://*)
+      [ "${PROJECT_CONTEXT_BOOTSTRAP_TESTING:-}" = "1" ] \
+        || fail "file URLs are allowed only during bootstrap tests"
+      ;;
+    *) fail "release base URL must use HTTPS" ;;
+  esac
+  if ! curl --fail --location --silent --show-error --retry 3 \
+    --proto '=https,file' --tlsv1.2 --output "$destination" "$source_url"; then
+    fail "download failed: $source_url"
+  fi
+}
+
+ensure_private_directory() {
+  private_directory=$1
+  [ ! -L "$private_directory" ] || fail "cache path must not be a symbolic link: $private_directory"
+  if [ -e "$private_directory" ] && [ ! -d "$private_directory" ]; then
+    fail "cache path is not a directory: $private_directory"
+  fi
+  if [ -d "$private_directory" ]; then
+    if stat -f '%Lp' "$private_directory" >/dev/null 2>&1; then
+      private_mode=$(stat -f '%Lp' "$private_directory") \
+        || fail "cannot inspect cache directory permissions: $private_directory"
+    else
+      private_mode=$(stat -c '%a' "$private_directory") \
+        || fail "cannot inspect cache directory permissions: $private_directory"
+    fi
+    [ "$private_mode" = "700" ] \
+      || fail "cache directory must have mode 0700: $private_directory"
+  else
+    mkdir -p "$private_directory" || fail "cannot create cache directory: $private_directory"
+    chmod 700 "$private_directory" || fail "cannot secure cache directory: $private_directory"
+  fi
+}
+
+cache_is_valid() {
+  [ -d "$binary_directory" ] && [ ! -L "$binary_directory" ] || return 1
+  [ -f "$binary_path" ] && [ ! -L "$binary_path" ] && [ -x "$binary_path" ] || return 1
+  [ -f "$cached_checksum_path" ] && [ ! -L "$cached_checksum_path" ] || return 1
+  [ -f "$cached_source_path" ] && [ ! -L "$cached_source_path" ] || return 1
+  cached_source=$(sed -n '1p' "$cached_source_path") || return 1
+  [ "$cached_source" = "$asset_url" ] || return 1
+  cached_expected_raw=$(sed -n '1p' "$cached_checksum_path") || return 1
+  cached_expected=$(checksum_from_line "$cached_expected_raw") || return 1
+  cached_actual_raw=$(sha256 "$binary_path") || return 1
+  cached_actual=$(normalize_checksum "$cached_actual_raw") || return 1
+  [ "$cached_expected" = "$cached_actual" ]
+}
+
+release_base_url=$DEFAULT_RELEASE_BASE_URL
+if [ "${PROJECT_CONTEXT_BOOTSTRAP_TESTING:-}" = "1" ]; then
+  release_base_url=${PROJECT_CONTEXT_RELEASE_BASE_URL:-$release_base_url}
+elif [ -n "${PROJECT_CONTEXT_RELEASE_BASE_URL:-}" ] \
+  && [ "$PROJECT_CONTEXT_RELEASE_BASE_URL" != "$DEFAULT_RELEASE_BASE_URL" ]; then
+  fail "PROJECT_CONTEXT_RELEASE_BASE_URL is allowed only during bootstrap tests"
+fi
+if [ "$PROJECT_CONTEXT_RELEASE_REPOSITORY" = "PENDING_GITHUB_REPOSITORY" ]; then
+  [ "${PROJECT_CONTEXT_BOOTSTRAP_TESTING:-}" = "1" ] \
+    || fail "GitHub Releases repository is pending"
+fi
+release_base_url=${release_base_url%/}
+
+for required_command in curl grep tr uname sed mkdir chmod mktemp stat; do
+  require_command "$required_command"
+done
+
+target=$(detect_target)
+asset_name="project-context-v${PROJECT_CONTEXT_VERSION}-${target}"
+asset_url="${release_base_url}/v${PROJECT_CONTEXT_VERSION}/${asset_name}"
+checksum_url="${asset_url}.sha256"
+
+if [ -n "${PROJECT_CONTEXT_CACHE_DIR:-}" ]; then
+  cache_root=$PROJECT_CONTEXT_CACHE_DIR
+elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+  cache_root="${XDG_CACHE_HOME}/project-context"
+elif [ -n "${HOME:-}" ]; then
+  cache_root="${HOME}/.cache/project-context"
+else
+  fail "cannot determine cache directory; set PROJECT_CONTEXT_CACHE_DIR"
+fi
+ensure_private_directory "$cache_root"
+
+binary_directory="${cache_root}/v${PROJECT_CONTEXT_VERSION}/${target}"
+binary_parent=${binary_directory%/*}
+ensure_private_directory "$binary_parent"
+binary_path="${binary_directory}/project-context"
+cached_checksum_path="${binary_directory}/project-context.sha256"
+cached_source_path="${binary_directory}/source-url"
+lock_directory="${binary_parent}/.${target}.lock"
+
+if ! cache_is_valid; then
+  lock_attempt=0
+  while ! mkdir "$lock_directory" 2>/dev/null; do
+    lock_attempt=$((lock_attempt + 1))
+    [ "$lock_attempt" -le 30 ] || fail "timed out waiting for the binary cache lock"
+    if [ -f "${lock_directory}/pid" ]; then
+      lock_pid=$(sed -n '1p' "${lock_directory}/pid" 2>/dev/null || true)
+      case "$lock_pid" in
+        ''|*[!0-9]*) ;;
+        *)
+          if ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "${lock_directory}/pid"
+            rmdir "$lock_directory" 2>/dev/null || true
+          fi
+          ;;
+      esac
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$$" > "${lock_directory}/pid" \
+    || fail "cannot record the binary cache lock owner"
+  staging_directory=""
+  cleanup_cache_work() {
+    if [ -n "$staging_directory" ] && [ -d "$staging_directory" ]; then
+      rm -rf "$staging_directory"
+    fi
+    rm -f "${lock_directory}/pid"
+    rmdir "$lock_directory" 2>/dev/null || true
+  }
+  trap cleanup_cache_work EXIT HUP INT TERM
+
+  if ! cache_is_valid; then
+    original_umask=$(umask)
+    umask 077
+    staging_directory=$(mktemp -d "${binary_parent}/.${target}.download.XXXXXX") \
+      || fail "cannot create binary cache staging directory"
+    downloaded_binary="${staging_directory}/project-context"
+    downloaded_checksum="${staging_directory}/project-context.sha256"
+    downloaded_source="${staging_directory}/source-url"
+    download "$asset_url" "$downloaded_binary"
+    download "$checksum_url" "$downloaded_checksum"
+
+    expected_raw=$(sed -n '1p' "$downloaded_checksum") \
+      || fail "cannot read the release checksum"
+    expected_checksum=$(checksum_from_line "$expected_raw") \
+      || fail "release checksum has an invalid format"
+    actual_raw=$(sha256 "$downloaded_binary") \
+      || fail "cannot calculate the downloaded binary checksum"
+    actual_checksum=$(normalize_checksum "$actual_raw") \
+      || fail "downloaded binary checksum has an invalid format"
+    [ "$expected_checksum" = "$actual_checksum" ] \
+      || fail "downloaded binary failed SHA-256 verification"
+
+    if [ "${PROJECT_CONTEXT_BOOTSTRAP_TESTING:-}" != "1" ]; then
+      if command -v gh >/dev/null 2>&1; then
+        gh attestation verify "$downloaded_binary" \
+          --repo "$PROJECT_CONTEXT_RELEASE_REPOSITORY" >/dev/null 2>&1 \
+          || fail "GitHub artifact attestation verification failed"
+        printf 'project-context: verified GitHub artifact attestation\n' >&2
+      else
+        printf 'project-context: gh is unavailable; verified SHA-256 only\n' >&2
+      fi
+    fi
+
+    chmod 700 "$downloaded_binary" \
+      || fail "cannot make the downloaded binary executable"
+    printf '%s\n' "$expected_checksum" > "$downloaded_checksum"
+    printf '%s\n' "$asset_url" > "$downloaded_source"
+    chmod 700 "$staging_directory"
+
+    stale_directory="${binary_directory}.stale.$$"
+    if [ -e "$binary_directory" ]; then
+      [ ! -L "$binary_directory" ] || fail "cached binary directory is a symbolic link"
+      mv "$binary_directory" "$stale_directory" \
+        || fail "cannot stage the previous binary cache"
+    fi
+    mv "$staging_directory" "$binary_directory" \
+      || fail "cannot publish the binary cache"
+    staging_directory=""
+    if [ -d "$stale_directory" ]; then
+      rm -rf "$stale_directory"
+    fi
+    umask "$original_umask"
+  fi
+  cleanup_cache_work
+  trap - EXIT HUP INT TERM
+fi
+
+set +e
+"$binary_path" "$@"
+binary_status=$?
+set -e
+case "$binary_status" in
+  126|127) fail "cached binary could not be executed" ;;
+  *) exit "$binary_status" ;;
+esac
