@@ -28,14 +28,15 @@ case "$machine_name" in
 esac
 
 target="${target_arch}-${target_system}"
-asset_name="project-context-v0.1.2-${target}"
+asset_name="project-context-v0.1.3-${target}"
 
 create_release() {
   release_root=$1
   fixture_label=$2
-  release_directory="${release_root}/v0.1.2"
+  release_directory="${release_root}/v0.1.3"
   mkdir -p "$release_directory"
   fixture_binary="${release_directory}/${asset_name}"
+  # shellcheck disable=SC2016 # The generated fixture must expand its own arguments.
   printf '%s\n' \
     '#!/bin/sh' \
     'if [ "${1:-}" = "create-file" ]; then : > "$2"; exit 0; fi' \
@@ -67,7 +68,7 @@ set -e
 [ "$missing_status" -eq 2 ]
 printf '%s\n' "$missing_output" | grep -q 'download failed'
 
-fixture_a="${release_a}/v0.1.2/${asset_name}"
+fixture_a="${release_a}/v0.1.3/${asset_name}"
 cp "${fixture_a}.sha256" "${fixture_a}.sha256.valid"
 printf '%064d\n' 0 > "${fixture_a}.sha256"
 set +e
@@ -126,7 +127,7 @@ output=$(
 [ "$output" = 'fixture-a:init --format json' ]
 printf '%s\n' "$lower_checksum" > "${fixture_a}.sha256"
 
-mv "${release_a}/v0.1.2" "${release_a}/v0.1.2.offline"
+mv "${release_a}/v0.1.3" "${release_a}/v0.1.3.offline"
 cached_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
   PROJECT_CONTEXT_RELEASE_BASE_URL="file://${release_a}" \
@@ -134,11 +135,11 @@ cached_output=$(
   "$launcher" validate
 )
 [ "$cached_output" = 'fixture-a:validate' ]
-mv "${release_a}/v0.1.2.offline" "${release_a}/v0.1.2"
+mv "${release_a}/v0.1.3.offline" "${release_a}/v0.1.3"
 
-printf '%s\n' '#!/bin/sh' 'printf "corrupt-cache-ran\n"' > "${test_root}/cache/v0.1.2/${target}/project-context"
-chmod 700 "${test_root}/cache/v0.1.2/${target}/project-context"
-mv "${release_a}/v0.1.2" "${release_a}/v0.1.2.offline"
+printf '%s\n' '#!/bin/sh' 'printf "corrupt-cache-ran\n"' > "${test_root}/cache/v0.1.3/${target}/project-context"
+chmod 700 "${test_root}/cache/v0.1.3/${target}/project-context"
+mv "${release_a}/v0.1.3" "${release_a}/v0.1.3.offline"
 set +e
 corrupt_offline_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
@@ -150,8 +151,11 @@ corrupt_offline_status=$?
 set -e
 [ "$corrupt_offline_status" -eq 2 ]
 printf '%s\n' "$corrupt_offline_output" | grep -q 'download failed'
-! printf '%s\n' "$corrupt_offline_output" | grep -q 'corrupt-cache-ran'
-mv "${release_a}/v0.1.2.offline" "${release_a}/v0.1.2"
+if printf '%s\n' "$corrupt_offline_output" | grep -q 'corrupt-cache-ran'; then
+  printf 'corrupt cached binary unexpectedly executed\n' >&2
+  exit 1
+fi
+mv "${release_a}/v0.1.3.offline" "${release_a}/v0.1.3"
 repaired_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
   PROJECT_CONTEXT_RELEASE_BASE_URL="file://${release_a}" \
@@ -160,7 +164,7 @@ repaired_output=$(
 )
 [ "$repaired_output" = 'fixture-a:validate' ]
 
-cached_checksum="${test_root}/cache/v0.1.2/${target}/project-context.sha256"
+cached_checksum="${test_root}/cache/v0.1.3/${target}/project-context.sha256"
 : > "$cached_checksum"
 recovered_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
@@ -243,6 +247,7 @@ printf '%s\n' "$symlink_output" | grep -q 'must not be a symbolic link'
 
 mock_path="${test_root}/mock-path"
 mkdir "$mock_path"
+# shellcheck disable=SC2016 # The generated uname fixture must inspect its own argument.
 printf '%s\n' '#!/bin/sh' 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) exit 2 ;; esac' > "${mock_path}/uname"
 printf '%s\n' '#!/bin/sh' 'exit 1' > "${mock_path}/getconf"
 chmod 700 "${mock_path}/uname" "${mock_path}/getconf"

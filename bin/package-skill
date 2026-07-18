@@ -15,8 +15,16 @@ case "$version" in
     ;;
 esac
 
-script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-repository_root=$(CDPATH= cd -- "${script_directory}/.." && pwd)
+script_directory=$(
+  CDPATH=
+  cd -- "$(dirname -- "$0")"
+  pwd
+)
+repository_root=$(
+  CDPATH=
+  cd -- "${script_directory}/.."
+  pwd
+)
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-package.XXXXXX")
 trap 'rm -rf "$temporary_root"' EXIT HUP INT TERM
 

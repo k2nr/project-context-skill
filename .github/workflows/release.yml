@@ -37,7 +37,7 @@ jobs:
           for test_file in tests/*.sh; do sh -n "${test_file}"; done
       - name: Check workflow syntax
         run: |
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
           "$(go env GOPATH)/bin/actionlint" .github/workflows/release.yml
       - name: Test launcher and package
         run: |
