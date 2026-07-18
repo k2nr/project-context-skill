@@ -21,8 +21,7 @@ The installation flow is:
    block, initialize repository data, populate the discovered project details,
    and validate the result.
 
-The concrete GitHub repository is pending. Replace `OWNER/REPOSITORY` before
-publishing this README.
+The official GitHub repository is `k2nr/project-context-skill`.
 
 Copy this instruction verbatim:
 
@@ -30,15 +29,15 @@ Copy this instruction verbatim:
 Install Project Context v0.1.0 into the current repository.
 
 Official GitHub repository:
-OWNER/REPOSITORY
+k2nr/project-context-skill
 
 Installation requirements:
 1. Work from the target repository root.
 2. Download these assets for tag v0.1.0 into a private temporary directory:
-   - https://github.com/OWNER/REPOSITORY/releases/download/v0.1.0/project-context-skill-v0.1.0.tar.gz
-   - https://github.com/OWNER/REPOSITORY/releases/download/v0.1.0/project-context-skill-v0.1.0.tar.gz.sha256
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.0/project-context-skill-v0.1.0.tar.gz
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.0/project-context-skill-v0.1.0.tar.gz.sha256
 3. Verify the archive with `sha256sum -c project-context-skill-v0.1.0.tar.gz.sha256` or `shasum -a 256 -c project-context-skill-v0.1.0.tar.gz.sha256`. Stop if verification fails.
-4. If `gh` already exists, also run `gh attestation verify project-context-skill-v0.1.0.tar.gz --repo OWNER/REPOSITORY`. Stop if this verification fails. Do not install `gh` solely for this step; report that attestation verification was unavailable and continue with the checksum when `gh` is absent.
+4. If `gh` already exists, also run `gh attestation verify project-context-skill-v0.1.0.tar.gz --repo k2nr/project-context-skill`. Stop if this verification fails. Do not install `gh` solely for this step; report that attestation verification was unavailable and continue with the checksum when `gh` is absent.
 5. Inspect the archive before extraction. It must contain exactly one top-level `project-context` directory, no absolute or parent-traversal paths, and no symbolic links.
 6. Extract the archive and install its `project-context` directory at `.agents/skills/project-context`. Do not install it globally.
 7. If `.agents/skills/project-context` already exists, compare it with the downloaded version. Do not overwrite or delete differing local files without asking me first.
@@ -108,8 +107,6 @@ binary. Cargo is not needed on target machines.
 
 Before publishing the first release:
 
-- Replace every `PENDING_GITHUB_REPOSITORY` and `OWNER/REPOSITORY` placeholder
-  with the same official GitHub repository.
 - Enable immutable GitHub Releases and protected release tags for `v*`.
 - Keep release tags on the repository default branch.
 - Retain full-commit-SHA pins for every GitHub Action.

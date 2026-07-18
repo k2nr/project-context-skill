@@ -2,7 +2,7 @@
 set -eu
 
 PROJECT_CONTEXT_VERSION="0.1.0"
-PROJECT_CONTEXT_RELEASE_REPOSITORY="PENDING_GITHUB_REPOSITORY"
+PROJECT_CONTEXT_RELEASE_REPOSITORY="k2nr/project-context-skill"
 DEFAULT_RELEASE_BASE_URL="https://github.com/${PROJECT_CONTEXT_RELEASE_REPOSITORY}/releases/download"
 
 fail() {
@@ -140,10 +140,6 @@ if [ "${PROJECT_CONTEXT_BOOTSTRAP_TESTING:-}" = "1" ]; then
 elif [ -n "${PROJECT_CONTEXT_RELEASE_BASE_URL:-}" ] \
   && [ "$PROJECT_CONTEXT_RELEASE_BASE_URL" != "$DEFAULT_RELEASE_BASE_URL" ]; then
   fail "PROJECT_CONTEXT_RELEASE_BASE_URL is allowed only during bootstrap tests"
-fi
-if [ "$PROJECT_CONTEXT_RELEASE_REPOSITORY" = "PENDING_GITHUB_REPOSITORY" ]; then
-  [ "${PROJECT_CONTEXT_BOOTSTRAP_TESTING:-}" = "1" ] \
-    || fail "GitHub Releases repository is pending"
 fi
 release_base_url=${release_base_url%/}
 
