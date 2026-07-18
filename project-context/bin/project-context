@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-PROJECT_CONTEXT_VERSION="0.1.0"
+PROJECT_CONTEXT_VERSION="0.1.1"
 PROJECT_CONTEXT_RELEASE_REPOSITORY="k2nr/project-context-skill"
 DEFAULT_RELEASE_BASE_URL="https://github.com/${PROJECT_CONTEXT_RELEASE_REPOSITORY}/releases/download"
 
