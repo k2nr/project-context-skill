@@ -53,6 +53,16 @@ project-context/assets/install/
 project-context/assets/install/AGENTS.fragment.md
 project-context/bin/
 project-context/bin/project-context
+reconstruct-project-context/
+reconstruct-project-context/LICENSE
+reconstruct-project-context/SKILL.md
+reconstruct-project-context/agents/
+reconstruct-project-context/agents/openai.yaml
+reconstruct-project-context/references/
+reconstruct-project-context/references/qualification.md
+reconstruct-project-context/references/sources.md
+reconstruct-project-context/scripts/
+reconstruct-project-context/scripts/inventory_local_history.py
 EOF
 LC_ALL=C sort -o "$expected" "$expected"
 diff -u "$expected" "$actual"
@@ -70,10 +80,14 @@ extract_root="${test_root}/extract"
 mkdir "$extract_root"
 tar -xzf "$archive" -C "$extract_root"
 package_root="${extract_root}/project-context"
+reconstruction_root="${extract_root}/reconstruct-project-context"
 [ -x "${package_root}/bin/project-context" ]
+[ -x "${reconstruction_root}/scripts/inventory_local_history.py" ]
 sh -n "${package_root}/bin/project-context"
 "$repository_root/bin/validate-skill" "$package_root"
+"$repository_root/bin/validate-skill" "$reconstruction_root"
 cmp "$repository_root/LICENSE" "${package_root}/LICENSE"
+cmp "$repository_root/LICENSE" "${reconstruction_root}/LICENSE"
 grep -q '<!-- project-context:managed:start -->' "${package_root}/assets/install/AGENTS.fragment.md"
 grep -q '<!-- project-context:managed:end -->' "${package_root}/assets/install/AGENTS.fragment.md"
 [ ! -e "${package_root}/cli" ]
@@ -84,6 +98,7 @@ if [ -x "$debug_binary" ]; then
   target_repository="${test_root}/target-repository"
   mkdir -p "${target_repository}/.agents/skills"
   cp -R "$package_root" "${target_repository}/.agents/skills/project-context"
+  cp -R "$reconstruction_root" "${target_repository}/.agents/skills/reconstruct-project-context"
   cp "${package_root}/assets/install/AGENTS.fragment.md" "${target_repository}/AGENTS.md"
 
   system_name=$(uname -s)

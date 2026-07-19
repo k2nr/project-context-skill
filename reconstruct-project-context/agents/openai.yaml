@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reconstruct Project Context"
+  short_description: "Rebuild durable context from local history"
+  default_prompt: "Use $reconstruct-project-context to rebuild durable project context from repository-linked local history."

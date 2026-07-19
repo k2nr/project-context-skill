@@ -63,6 +63,7 @@ impl ValidationReport {
 #[derive(Debug)]
 pub enum StoreError {
     Invalid(ValidationReport),
+    Conflict(String),
     Environment(String),
 }
 
@@ -95,6 +96,43 @@ pub struct AttemptInput {
     pub evidence: Vec<String>,
 }
 
+pub struct ReconstructionInput {
+    pub base_model: PathBuf,
+    pub base_events: PathBuf,
+    pub model: PathBuf,
+    pub events: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconstructionReport {
+    pub model_changed: bool,
+    pub events_added: usize,
+    pub duplicates_skipped: usize,
+    pub no_op: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TransactionKind {
+    Init,
+    Reconstruction,
+}
+
+impl TransactionKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Reconstruction => "reconstruction",
+        }
+    }
+
+    fn paths(self) -> &'static [&'static str] {
+        match self {
+            Self::Init => &INIT_PATHS,
+            Self::Reconstruction => &RECONSTRUCTION_PATHS,
+        }
+    }
+}
+
 struct RepositoryDocuments {
     model_schema: String,
     event_schema: String,
@@ -102,12 +140,17 @@ struct RepositoryDocuments {
     events: String,
 }
 
+const RECONSTRUCTION_PATHS: [&str; 2] = [
+    ".project-context/model.yaml",
+    ".project-context/events.jsonl",
+];
+
 pub fn initialize(root: &Path, force: bool) -> Result<InitReport, String> {
     let project_directory = root.join(".project-context");
     fs::create_dir_all(&project_directory)
         .map_err(|error| format!("cannot create {}: {error}", project_directory.display()))?;
     let lock = open_lock(root, true)?;
-    recover_init_transaction(root)?;
+    recover_transaction(root)?;
     cleanup_stale_temporary_files(root);
     let result = initialize_locked(root, force);
     let _ = lock.unlock();
@@ -152,7 +195,7 @@ fn initialize_locked(root: &Path, force: bool) -> Result<InitReport, String> {
         MODEL_SCHEMA.as_bytes().to_vec(),
         EVENT_SCHEMA.as_bytes().to_vec(),
     ];
-    transactional_replace(root, &contents)?;
+    transactional_replace(root, TransactionKind::Init, &contents)?;
     Ok(InitReport {
         initialized: true,
         files: INIT_PATHS.iter().map(|path| (*path).to_owned()).collect(),
@@ -180,22 +223,37 @@ fn initial_model(root: &Path) -> Result<String, String> {
         .map_err(|error| format!("cannot render embedded model template: {error}"))
 }
 
-fn transactional_replace(root: &Path, contents: &[Vec<u8>; 4]) -> Result<(), String> {
+fn transactional_replace(
+    root: &Path,
+    kind: TransactionKind,
+    contents: &[Vec<u8>],
+) -> Result<(), String> {
+    let paths = kind.paths();
+    if paths.len() != contents.len() {
+        return Err("transaction contents do not match the allowed path set".to_owned());
+    }
     let transaction = root.join(TRANSACTION_DIRECTORY);
     if transaction.exists() {
-        return Err("an initialization transaction is already present".to_owned());
+        return Err("a project-context transaction is already present".to_owned());
     }
     fs::create_dir(&transaction)
-        .map_err(|error| format!("cannot create initialization transaction: {error}"))?;
+        .map_err(|error| format!("cannot create project-context transaction: {error}"))?;
     let staged_root = transaction.join("staged");
     let backup_root = transaction.join("backup");
+    write_synced_file(
+        &transaction.join("kind"),
+        format!("{}\n", kind.name()).as_bytes(),
+    )?;
+    File::open(&transaction)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("cannot sync transaction kind marker: {error}"))?;
     fs::create_dir(&staged_root)
         .map_err(|error| format!("cannot create transaction staging area: {error}"))?;
     fs::create_dir(&backup_root)
         .map_err(|error| format!("cannot create transaction backup area: {error}"))?;
 
     let result = (|| -> Result<(), String> {
-        for (relative, content) in INIT_PATHS.iter().zip(contents) {
+        for (relative, content) in paths.iter().zip(contents) {
             let inner = relative.trim_start_matches(".project-context/");
             let staged = staged_root.join(inner);
             if let Some(parent) = staged.parent() {
@@ -204,17 +262,30 @@ fn transactional_replace(root: &Path, contents: &[Vec<u8>; 4]) -> Result<(), Str
             }
             write_synced_file(&staged, content)?;
             let destination = root.join(relative);
-            if destination.exists() {
-                for warning in copy_metadata(&destination, &staged)? {
-                    eprintln!("warning: {warning}");
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) if !metadata.file_type().is_file() => {
+                    return Err(format!(
+                        "refusing to replace non-regular transaction target {relative}"
+                    ));
                 }
+                Ok(_) => {
+                    for warning in copy_metadata(&destination, &staged)? {
+                        eprintln!("warning: {warning}");
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot inspect {relative}: {error}")),
             }
         }
         File::open(&staged_root)
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("cannot sync transaction staging area: {error}"))?;
+        write_synced_file(&transaction.join("prepared"), b"prepared\n")?;
+        File::open(&transaction)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("cannot sync prepared transaction: {error}"))?;
 
-        for relative in INIT_PATHS {
+        for relative in paths {
             let inner = relative.trim_start_matches(".project-context/");
             let destination = root.join(relative);
             let staged = staged_root.join(inner);
@@ -223,7 +294,7 @@ fn transactional_replace(root: &Path, contents: &[Vec<u8>; 4]) -> Result<(), Str
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
             }
-            if destination.exists() {
+            if fs::symlink_metadata(&destination).is_ok() {
                 if let Some(parent) = backup.parent() {
                     fs::create_dir_all(parent)
                         .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -238,45 +309,121 @@ fn transactional_replace(root: &Path, contents: &[Vec<u8>; 4]) -> Result<(), Str
         write_synced_file(&transaction.join("committed"), b"committed\n")?;
         File::open(root.join(".project-context"))
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                format!("cannot sync .project-context after initialization: {error}")
-            })?;
+            .map_err(|error| format!("cannot sync .project-context after transaction: {error}"))?;
         Ok(())
     })();
 
     if let Err(error) = result {
-        let rollback = rollback_init_transaction(root);
+        let rollback = rollback_transaction(root);
         return match rollback {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(format!(
-                "{error}; initialization rollback also failed: {rollback_error}"
+                "{error}; transaction rollback also failed: {rollback_error}"
             )),
         };
     }
     fs::remove_dir_all(&transaction)
-        .map_err(|error| format!("cannot remove committed initialization transaction: {error}"))?;
+        .map_err(|error| format!("cannot remove committed project-context transaction: {error}"))?;
     Ok(())
 }
 
-fn recover_init_transaction(root: &Path) -> Result<(), String> {
+fn recover_transaction(root: &Path) -> Result<(), String> {
     let transaction = root.join(TRANSACTION_DIRECTORY);
-    if !transaction.exists() {
-        return Ok(());
+    match fs::symlink_metadata(&transaction) {
+        Ok(metadata) if !metadata.file_type().is_dir() => {
+            return Err("project-context transaction path is not a regular directory".to_owned());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect project-context transaction: {error}"
+            ));
+        }
     }
+    transaction_kind(root)?;
+    validate_transaction_member_types(&transaction)?;
     if transaction.join("committed").is_file() {
         fs::remove_dir_all(&transaction).map_err(|error| {
-            format!("cannot finish committed initialization transaction: {error}")
+            format!("cannot finish committed project-context transaction: {error}")
         })?;
         return Ok(());
     }
-    rollback_init_transaction(root)
+    rollback_transaction(root)
 }
 
-fn rollback_init_transaction(root: &Path) -> Result<(), String> {
+fn validate_transaction_member_types(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect project-context transaction member: {error}"))?;
+    if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+        return Err(format!(
+            "project-context transaction contains an unsupported member: {}",
+            path.display()
+        ));
+    }
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)
+            .map_err(|error| format!("cannot read project-context transaction: {error}"))?
+        {
+            let entry = entry
+                .map_err(|error| format!("cannot read project-context transaction: {error}"))?;
+            validate_transaction_member_types(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn transaction_kind(root: &Path) -> Result<TransactionKind, String> {
+    let marker = root.join(TRANSACTION_DIRECTORY).join("kind");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err("project-context transaction kind is not a regular file".to_owned());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            for directory in ["staged", "backup"] {
+                let path = root.join(TRANSACTION_DIRECTORY).join(directory);
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    format!("legacy initialization transaction is incomplete: {error}")
+                })?;
+                if !metadata.file_type().is_dir() {
+                    return Err(format!(
+                        "legacy initialization transaction has invalid {directory} directory"
+                    ));
+                }
+            }
+            return Ok(TransactionKind::Init);
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect project-context transaction kind: {error}"
+            ));
+        }
+    }
+    match fs::read_to_string(&marker) {
+        Ok(value) => match value.as_str() {
+            "init\n" => Ok(TransactionKind::Init),
+            "reconstruction\n" => Ok(TransactionKind::Reconstruction),
+            other => Err(format!(
+                "unknown project-context transaction kind: {}",
+                other.escape_default()
+            )),
+        },
+        Err(error) => Err(format!(
+            "cannot read project-context transaction kind: {error}"
+        )),
+    }
+}
+
+fn rollback_transaction(root: &Path) -> Result<(), String> {
     let transaction = root.join(TRANSACTION_DIRECTORY);
+    let kind = transaction_kind(root)?;
+    validate_transaction_member_types(&transaction)?;
+    let typed_transaction = transaction.join("kind").is_file();
+    let prepared = transaction.join("prepared").is_file();
     let staged_root = transaction.join("staged");
     let backup_root = transaction.join("backup");
-    for relative in INIT_PATHS.into_iter().rev() {
+    for relative in kind.paths().iter().rev() {
         let inner = relative.trim_start_matches(".project-context/");
         let destination = root.join(relative);
         let staged = staged_root.join(inner);
@@ -291,7 +438,7 @@ fn rollback_init_transaction(root: &Path) -> Result<(), String> {
             }
             fs::rename(&backup, &destination)
                 .map_err(|error| format!("cannot restore {relative}: {error}"))?;
-        } else if !staged.exists() && destination.exists() {
+        } else if (!typed_transaction || prepared) && !staged.exists() && destination.exists() {
             remove_regular_file(&destination)?;
         }
     }
@@ -383,7 +530,7 @@ pub fn load_valid_repository(root: &Path) -> Result<RepositoryData, StoreError> 
 
 pub fn configure(root: &Path, input: ConfigureInput) -> Result<ConfigureReport, StoreError> {
     let lock = open_lock(root, true).map_err(StoreError::Environment)?;
-    recover_init_transaction(root).map_err(StoreError::Environment)?;
+    recover_transaction(root).map_err(StoreError::Environment)?;
     let documents = read_documents(root)?;
     let (current_report, _) = inspect_documents(
         &documents.model_schema,
@@ -488,6 +635,458 @@ pub fn configure(root: &Path, input: ConfigureInput) -> Result<ConfigureReport, 
     Ok(ConfigureReport { updated })
 }
 
+pub fn apply_reconstruction(
+    root: &Path,
+    input: ReconstructionInput,
+) -> Result<ReconstructionReport, StoreError> {
+    let base_model = read_input_file(&input.base_model, "base model")?;
+    let base_events = read_input_file(&input.base_events, "base events")?;
+    let proposed_model = read_input_file(&input.model, "proposed model")?;
+    let proposed_new_events = read_input_file(&input.events, "proposed events")?;
+
+    let lock = open_lock(root, true).map_err(StoreError::Environment)?;
+    recover_transaction(root).map_err(StoreError::Environment)?;
+    let documents = read_documents(root)?;
+    if documents.model.as_bytes() != base_model.as_bytes()
+        || documents.events.as_bytes() != base_events.as_bytes()
+    {
+        let _ = lock.unlock();
+        return Err(StoreError::Conflict(
+            "project-context data changed after reconstruction began".to_owned(),
+        ));
+    }
+
+    let (current_report, current_data) = inspect_documents(
+        &documents.model_schema,
+        &documents.event_schema,
+        &documents.model,
+        &documents.events,
+    );
+    if !current_report.valid {
+        let _ = lock.unlock();
+        return Err(StoreError::Invalid(current_report));
+    }
+
+    let base_model_value = yaml_to_json(&documents.model, "base model")?;
+    let mut proposed_model_value = yaml_to_json(&proposed_model, "proposed model")?;
+    let mut merge_errors = validate_model_merge(&base_model_value, &proposed_model_value);
+    let mut candidates =
+        parse_event_lines(&proposed_new_events, "proposed events", &mut merge_errors);
+    let mut candidate_ids = BTreeSet::new();
+    for event in &candidates {
+        if let Some(id) = event.get("id").and_then(Value::as_str) {
+            if !valid_candidate_key(id) {
+                merge_errors.push(format!(
+                    "proposed candidate ID '{id}' must use the candidate: namespace"
+                ));
+            } else if !candidate_ids.insert(id.to_owned()) {
+                merge_errors.push(format!("duplicate proposed candidate ID '{id}'"));
+            }
+        }
+    }
+
+    let mut existing_by_key = BTreeMap::new();
+    for event in &current_data.events {
+        if let (Some(key), Some(id)) = (
+            event_dedupe_key(event),
+            event.get("id").and_then(Value::as_str),
+        ) {
+            existing_by_key.insert(key, (id.to_owned(), event.clone()));
+        }
+    }
+
+    let mut id_remap = BTreeMap::new();
+    let mut seen_new: BTreeMap<String, (String, Value)> = BTreeMap::new();
+    let mut supersession_checks = Vec::new();
+    let mut retained = Vec::new();
+    let mut duplicates_skipped = 0;
+    for event in candidates.drain(..) {
+        let Some(id) = event.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            retained.push(event);
+            continue;
+        };
+        let Some(key) = event_dedupe_key(&event) else {
+            retained.push(event);
+            continue;
+        };
+        if let Some((existing_id, existing)) = existing_by_key.get(&key) {
+            supersession_checks.push((
+                id.clone(),
+                existing_id.clone(),
+                event.clone(),
+                existing.clone(),
+            ));
+            id_remap.insert(id, existing_id.clone());
+            duplicates_skipped += 1;
+        } else if let Some((first_id, first_event)) = seen_new.get(&key) {
+            supersession_checks.push((
+                id.clone(),
+                first_id.clone(),
+                event.clone(),
+                first_event.clone(),
+            ));
+            id_remap.insert(id, first_id.clone());
+            duplicates_skipped += 1;
+        } else {
+            seen_new.insert(key, (id, event.clone()));
+            retained.push(event);
+        }
+    }
+
+    retained.sort_by_key(|event| {
+        (
+            event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            event_dedupe_key(event).unwrap_or_default(),
+        )
+    });
+    let mut allocated_events = current_data.events.clone();
+    for event in &mut retained {
+        let Some(candidate_id) = event.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let prefix = match event.get("type").and_then(Value::as_str) {
+            Some("decision") => "D",
+            Some("attempt") => "A",
+            _ => continue,
+        };
+        let allocated_id = next_event_id(prefix, &allocated_events).map_err(|error| {
+            StoreError::Environment(format!("cannot allocate event ID: {error}"))
+        })?;
+        event["id"] = Value::String(allocated_id.clone());
+        id_remap.insert(candidate_id, allocated_id);
+        allocated_events.push(event.clone());
+    }
+    let resolved_remap = match resolve_reference_map(&id_remap) {
+        Ok(remap) => remap,
+        Err(error) => {
+            merge_errors.push(error);
+            BTreeMap::new()
+        }
+    };
+    for (candidate_id, matched_id, mut candidate, mut matched) in supersession_checks {
+        remap_event_references(std::slice::from_mut(&mut candidate), &resolved_remap);
+        remap_event_references(std::slice::from_mut(&mut matched), &resolved_remap);
+        if normalized_supersedes(&candidate) != normalized_supersedes(&matched) {
+            merge_errors.push(format!(
+                "proposed event '{candidate_id}' duplicates '{matched_id}' with different supersedes"
+            ));
+        }
+    }
+    remap_event_references(&mut retained, &resolved_remap);
+    remap_model_references(&mut proposed_model_value, &resolved_remap);
+    let proposed_model = serde_yaml_ng::to_string(&proposed_model_value).map_err(|error| {
+        StoreError::Environment(format!("cannot serialize proposed model: {error}"))
+    })?;
+
+    let mut combined_events = documents.events.clone();
+    if !combined_events.is_empty() && !combined_events.ends_with('\n') && !retained.is_empty() {
+        combined_events.push('\n');
+    }
+    for event in &retained {
+        let serialized = serde_json::to_string(event).map_err(|error| {
+            StoreError::Environment(format!("cannot serialize proposed event: {error}"))
+        })?;
+        combined_events.push_str(&serialized);
+        combined_events.push('\n');
+    }
+
+    let (mut proposed_report, _) = inspect_documents(
+        &documents.model_schema,
+        &documents.event_schema,
+        &proposed_model,
+        &combined_events,
+    );
+    proposed_report.errors.extend(merge_errors);
+    proposed_report.normalize();
+    if !proposed_report.valid {
+        let _ = lock.unlock();
+        return Err(StoreError::Invalid(proposed_report));
+    }
+
+    let model_changed = proposed_model.as_bytes() != documents.model.as_bytes();
+    let no_op = !model_changed && retained.is_empty();
+    if !no_op {
+        transactional_replace(
+            root,
+            TransactionKind::Reconstruction,
+            &[proposed_model.into_bytes(), combined_events.into_bytes()],
+        )
+        .map_err(StoreError::Environment)?;
+    }
+    let _ = lock.unlock();
+    Ok(ReconstructionReport {
+        model_changed,
+        events_added: retained.len(),
+        duplicates_skipped,
+        no_op,
+    })
+}
+
+fn valid_candidate_key(id: &str) -> bool {
+    id.strip_prefix("candidate:").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.len() <= 240
+            && suffix
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character))
+    })
+}
+
+fn resolve_reference_map(
+    remap: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    remap
+        .keys()
+        .map(|source| {
+            let mut target = source.clone();
+            let mut visited = BTreeSet::new();
+            while let Some(next) = remap.get(&target) {
+                if !visited.insert(target.clone()) {
+                    return Err(format!(
+                        "candidate reference remap cycle includes '{source}'"
+                    ));
+                }
+                target = next.clone();
+            }
+            Ok((source.clone(), target))
+        })
+        .collect()
+}
+
+fn read_input_file(path: &Path, label: &str) -> Result<String, StoreError> {
+    fs::read_to_string(path).map_err(|error| {
+        StoreError::Environment(format!("cannot read {label} {}: {error}", path.display()))
+    })
+}
+
+fn yaml_to_json(content: &str, label: &str) -> Result<Value, StoreError> {
+    let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(content)
+        .map_err(|error| invalid_data_error(format!("cannot parse {label}: {error}")))?;
+    serde_json::to_value(yaml)
+        .map_err(|error| invalid_data_error(format!("cannot convert {label}: {error}")))
+}
+
+fn invalid_data_error(message: String) -> StoreError {
+    let mut report = ValidationReport::default();
+    report.errors.push(message);
+    report.normalize();
+    StoreError::Invalid(report)
+}
+
+fn validate_model_merge(base: &Value, proposed: &Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Some(project) = base.get("project").and_then(Value::as_object) {
+        for (field, base_value) in project {
+            let proposed_value = proposed.get("project").and_then(|value| value.get(field));
+            if !model_value_is_empty(base_value) && proposed_value != Some(base_value) {
+                errors.push(format!("proposed model changes existing project.{field}"));
+            }
+        }
+    }
+    for section in ["principles", "architecture", "behaviors", "constraints"] {
+        let proposed_entries = proposed
+            .get(section)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for entry in base
+            .get(section)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if !proposed_entries.contains(entry) {
+                let id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                errors.push(format!(
+                    "proposed model changes or removes existing {section} entry '{id}'"
+                ));
+            }
+        }
+    }
+    let base_entries = model_entries(base);
+    let base_ids: BTreeSet<&str> = base_entries
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .collect();
+    let base_statements: BTreeSet<String> = base_entries
+        .iter()
+        .filter_map(|entry| normalized_model_statement(entry))
+        .collect();
+    let mut new_ids = BTreeSet::new();
+    let mut new_statements = BTreeSet::new();
+    for entry in model_entries(proposed) {
+        if base_entries.contains(&entry) {
+            continue;
+        }
+        if let Some(id) = entry.get("id").and_then(Value::as_str)
+            && (base_ids.contains(id) || !new_ids.insert(id.to_owned()))
+        {
+            errors.push(format!(
+                "proposed model entry ID '{id}' conflicts with another entry"
+            ));
+        }
+        if let Some(statement) = normalized_model_statement(entry)
+            && (base_statements.contains(&statement) || !new_statements.insert(statement.clone()))
+        {
+            errors.push(format!(
+                "proposed model statement conflicts with another entry: {statement}"
+            ));
+        }
+    }
+    for operation in ["build", "test", "lint", "format"] {
+        let pointer = format!("/operations/{operation}");
+        if let Some(base_value) = base.pointer(&pointer)
+            && base_value
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+            && proposed.pointer(&pointer) != Some(base_value)
+        {
+            errors.push(format!(
+                "proposed model changes non-empty operations.{operation}"
+            ));
+        }
+    }
+    if proposed.get("extensions") != base.get("extensions") {
+        errors.push("proposed model changes existing extensions".to_owned());
+    }
+    errors
+}
+
+fn model_entries(model: &Value) -> Vec<&Value> {
+    ["principles", "architecture", "behaviors", "constraints"]
+        .into_iter()
+        .flat_map(|section| {
+            model
+                .get(section)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .collect()
+}
+
+fn normalized_model_statement(entry: &Value) -> Option<String> {
+    entry
+        .get("statement")
+        .and_then(Value::as_str)
+        .map(|statement| statement.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn model_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(values) => values.is_empty(),
+        Value::Object(values) => values.is_empty(),
+        _ => false,
+    }
+}
+
+fn parse_event_lines(content: &str, label: &str, errors: &mut Vec<String>) -> Vec<Value> {
+    let mut events = Vec::new();
+    for (index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            errors.push(format!("{label} line {} is empty", index + 1));
+            continue;
+        }
+        match serde_json::from_str::<UniqueValue>(line) {
+            Ok(UniqueValue(value)) => events.push(value),
+            Err(error) => errors.push(format!(
+                "{label} line {} is not valid JSON: {error}",
+                index + 1
+            )),
+        }
+    }
+    events
+}
+
+fn event_dedupe_key(event: &Value) -> Option<String> {
+    let mut value = event.clone();
+    let object = value.as_object_mut()?;
+    object.remove("id");
+    object.remove("supersedes");
+    normalize_semantic_value(&mut value);
+    serde_json::to_string(&value).ok()
+}
+
+fn normalize_semantic_value(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        Value::Array(values) => {
+            for value in values.iter_mut() {
+                normalize_semantic_value(value);
+            }
+            values.sort_by_key(|value| serde_json::to_string(value).unwrap_or_default());
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                normalize_semantic_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalized_supersedes(event: &Value) -> Vec<String> {
+    let mut values: Vec<String> = event
+        .get("supersedes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn remap_event_references(events: &mut [Value], remap: &BTreeMap<String, String>) {
+    for event in events {
+        if let Some(references) = event.get_mut("supersedes").and_then(Value::as_array_mut) {
+            for reference in references.iter_mut() {
+                if let Some(id) = reference.as_str()
+                    && let Some(replacement) = remap.get(id)
+                {
+                    *reference = Value::String(replacement.clone());
+                }
+            }
+        }
+    }
+}
+
+fn remap_model_references(model: &mut Value, remap: &BTreeMap<String, String>) {
+    for section in ["principles", "architecture", "behaviors", "constraints"] {
+        let Some(entries) = model.get_mut(section).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(references) = entry
+                .get_mut("related_events")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            for reference in references {
+                if let Some(id) = reference.as_str()
+                    && let Some(replacement) = remap.get(id)
+                {
+                    *reference = Value::String(replacement.clone());
+                }
+            }
+        }
+    }
+}
+
 pub fn add_decision(root: &Path, input: DecisionInput) -> Result<Value, StoreError> {
     append_event(root, move |events| {
         let mut event = base_event(
@@ -525,7 +1124,7 @@ where
     F: FnOnce(&[Value]) -> Result<Value, String>,
 {
     let lock = open_lock(root, true).map_err(StoreError::Environment)?;
-    recover_init_transaction(root).map_err(StoreError::Environment)?;
+    recover_transaction(root).map_err(StoreError::Environment)?;
     cleanup_stale_temporary_files(root);
     let documents = read_documents(root)?;
     let (current_report, data) = inspect_documents(
@@ -675,11 +1274,17 @@ fn open_lock(root: &Path, exclusive: bool) -> Result<File, String> {
 }
 
 fn recover_before_read(root: &Path) -> Result<(), StoreError> {
-    if !root.join(TRANSACTION_DIRECTORY).exists() {
-        return Ok(());
+    match fs::symlink_metadata(root.join(TRANSACTION_DIRECTORY)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(StoreError::Environment(format!(
+                "cannot inspect project-context transaction: {error}"
+            )));
+        }
+        Ok(_) => {}
     }
     let lock = open_lock(root, true).map_err(StoreError::Environment)?;
-    let result = recover_init_transaction(root).map_err(StoreError::Environment);
+    let result = recover_transaction(root).map_err(StoreError::Environment);
     let _ = lock.unlock();
     result
 }
@@ -694,18 +1299,35 @@ fn read_documents(root: &Path) -> Result<RepositoryDocuments, StoreError> {
 }
 
 fn read_required(path: &Path) -> Result<String, StoreError> {
-    fs::read_to_string(path).map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            let mut report = ValidationReport::default();
+            report.errors.push(format!(
+                "required project-context path is not a regular file: {}",
+                path.display()
+            ));
+            report.normalize();
+            return Err(StoreError::Invalid(report));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let mut report = ValidationReport::default();
             report.errors.push(format!(
                 "required project-context file is missing: {}",
                 path.display()
             ));
             report.normalize();
-            StoreError::Invalid(report)
-        } else {
-            StoreError::Environment(format!("cannot read {}: {error}", path.display()))
+            return Err(StoreError::Invalid(report));
         }
+        Err(error) => {
+            return Err(StoreError::Environment(format!(
+                "cannot inspect {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    fs::read_to_string(path).map_err(|error| {
+        StoreError::Environment(format!("cannot read {}: {error}", path.display()))
     })
 }
 
@@ -1375,6 +1997,92 @@ mod tests {
     }
 
     #[test]
+    fn startup_rolls_back_only_reconstruction_targets_for_a_typed_transaction() {
+        let directory = initialized();
+        let project = directory.path().join(".project-context");
+        let original_model = fs::read(project.join("model.yaml")).expect("original model");
+        let original_events = fs::read(project.join("events.jsonl")).expect("original events");
+        let original_schema =
+            fs::read(project.join("schemas/model.schema.json")).expect("original schema");
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(transaction.join("backup")).expect("backup directory");
+        write(&transaction.join("kind"), "reconstruction\n");
+        fs::rename(
+            project.join("model.yaml"),
+            transaction.join("backup/model.yaml"),
+        )
+        .expect("backup model");
+        fs::rename(
+            project.join("events.jsonl"),
+            transaction.join("backup/events.jsonl"),
+        )
+        .expect("backup events");
+        write(&project.join("model.yaml"), "interrupted model\n");
+        write(&project.join("events.jsonl"), "interrupted events\n");
+
+        let report = validate_repository(directory.path()).expect("recover then validate");
+        assert!(report.valid, "{:?}", report.errors);
+        assert_eq!(
+            fs::read(project.join("model.yaml")).unwrap(),
+            original_model
+        );
+        assert_eq!(
+            fs::read(project.join("events.jsonl")).unwrap(),
+            original_events
+        );
+        assert_eq!(
+            fs::read(project.join("schemas/model.schema.json")).unwrap(),
+            original_schema
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn startup_preserves_targets_when_a_typed_transaction_was_not_prepared() {
+        let directory = initialized();
+        let project = directory.path().join(".project-context");
+        let original_model = fs::read(project.join("model.yaml")).expect("original model");
+        let original_events = fs::read(project.join("events.jsonl")).expect("original events");
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(transaction.join("staged")).expect("staging directory");
+        fs::create_dir_all(transaction.join("backup")).expect("backup directory");
+        write(&transaction.join("kind"), "reconstruction\n");
+
+        let report = validate_repository(directory.path()).expect("recover then validate");
+        assert!(report.valid, "{:?}", report.errors);
+        assert_eq!(
+            fs::read(project.join("model.yaml")).unwrap(),
+            original_model
+        );
+        assert_eq!(
+            fs::read(project.join("events.jsonl")).unwrap(),
+            original_events
+        );
+        assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn startup_rejects_an_unknown_transaction_kind_without_mutation() {
+        let directory = initialized();
+        let project = directory.path().join(".project-context");
+        let original_model = fs::read(project.join("model.yaml")).expect("original model");
+        let transaction = directory.path().join(TRANSACTION_DIRECTORY);
+        fs::create_dir_all(&transaction).expect("transaction directory");
+        write(&transaction.join("kind"), "future-kind\n");
+        write(&transaction.join("committed"), "committed\n");
+
+        let error = validate_repository(directory.path()).expect_err("unknown kind is refused");
+        assert!(
+            matches!(error, StoreError::Environment(message) if message.contains("unknown project-context transaction kind"))
+        );
+        assert_eq!(
+            fs::read(project.join("model.yaml")).unwrap(),
+            original_model
+        );
+        assert!(transaction.exists());
+    }
+
+    #[test]
     fn validation_rejects_schema_tampering_and_recursive_duplicate_keys() {
         let schema_directory = initialized();
         write(
@@ -1503,6 +2211,68 @@ mod tests {
                 "event should be invalid: {event}"
             );
         }
+    }
+
+    #[test]
+    fn reconstruction_merge_preserves_authoritative_base_model_fields() {
+        let base = json!({
+            "project": {"id": "fixture", "description": "Base description."},
+            "principles": [{"id": "base", "statement": "Preserve this."}],
+            "architecture": [],
+            "behaviors": [],
+            "constraints": [],
+            "operations": {"build": ["cargo build"], "test": [], "lint": [], "format": []},
+            "extensions": {"owner": "base"}
+        });
+        let proposed = json!({
+            "project": {"id": "changed", "description": "Changed."},
+            "principles": [],
+            "architecture": [],
+            "behaviors": [],
+            "constraints": [],
+            "operations": {"build": ["make"], "test": [], "lint": [], "format": []},
+            "extensions": {"owner": "changed"}
+        });
+        let errors = validate_model_merge(&base, &proposed);
+        for expected in [
+            "project.id",
+            "project.description",
+            "principles entry 'base'",
+            "operations.build",
+            "extensions",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing merge error for {expected}: {errors:?}"
+            );
+        }
+
+        let duplicate_statement = json!({
+            "project": {"id": "fixture", "description": "Base description."},
+            "principles": [{"id": "base", "statement": "Preserve this."}],
+            "architecture": [{"id": "duplicate", "statement": " Preserve   this. "}],
+            "behaviors": [],
+            "constraints": [],
+            "operations": {"build": ["cargo build"], "test": [], "lint": [], "format": []},
+            "extensions": {"owner": "base"}
+        });
+        assert!(
+            validate_model_merge(&base, &duplicate_statement)
+                .iter()
+                .any(|error| error.contains("statement conflicts"))
+        );
+    }
+
+    #[test]
+    fn reconstruction_candidate_keys_cannot_collide_or_cycle() {
+        assert!(valid_candidate_key("candidate:decision-one"));
+        assert!(!valid_candidate_key("D-0001"));
+        assert!(!valid_candidate_key("A-0001"));
+        let remap = BTreeMap::from([
+            ("candidate:first".to_owned(), "candidate:second".to_owned()),
+            ("candidate:second".to_owned(), "candidate:first".to_owned()),
+        ]);
+        assert!(resolve_reference_map(&remap).is_err());
     }
 
     #[test]

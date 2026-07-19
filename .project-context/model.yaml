@@ -8,11 +8,19 @@ architecture:
     statement: The standalone installer is a checksummed and attested release asset that verifies the skill package before repository writes and delegates canonical model mutation to the CLI.
     related_events:
       - D-0001
+  - id: separate-history-reconstruction
+    statement: Repository history reconstruction is provided by a separately invoked local skill that inventories only approved Git, repository, and metadata-linked Codex or Claude Code sources.
+    related_events:
+      - D-0002
 behaviors:
   - id: safe-installation
     statement: Installation supports preflight and dry-run reports, refuses differing local skill files or malformed managed markers, preserves existing history, and cleans private temporary state on every exit.
     related_events:
       - D-0001
+  - id: evidence-constrained-reconstruction
+    statement: After the source-scope gate, reconstruction automatically applies only evidence-qualified, non-conflicting model additions and reusable decision or attempt events through a base-state checked transaction.
+    related_events:
+      - D-0002
 constraints: []
 operations:
   build:
@@ -24,6 +32,7 @@ operations:
     - tests/test-package.sh
     - tests/test-installer-package.sh
     - tests/test-installer.sh
+    - tests/test-reconstruction.sh
   lint:
     - cargo clippy --locked --manifest-path cli/Cargo.toml --all-targets -- -D warnings
     - shellcheck project-context/bin/project-context bin/* tests/*.sh

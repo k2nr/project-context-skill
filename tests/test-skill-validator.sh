@@ -10,6 +10,7 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-skill-validator-test.XXXX
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 
 "${repository_root}/bin/validate-skill" "${repository_root}/project-context" >/dev/null
+"${repository_root}/bin/validate-skill" "${repository_root}/reconstruct-project-context" >/dev/null
 
 mkdir -p "${test_root}/invalid/agents"
 cp "${repository_root}/project-context/agents/openai.yaml" "${test_root}/invalid/agents/openai.yaml"

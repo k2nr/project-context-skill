@@ -125,6 +125,41 @@ for non-trivial work without explicit user invocation. Skill discovery remains
 a capability of the coding-agent host, so unsupported hosts may require their
 own equivalent repository instruction mechanism.
 
+## History Reconstruction Skill
+
+The source tree defines a second repository-local skill,
+`reconstruct-project-context`, alongside the automatically loaded
+`project-context` skill. The reconstruction skill is invoked only when a user
+asks to recover or backfill durable context from past project history; the
+managed `AGENTS.md` block does not start it automatically.
+
+When the source scope is not already explicit, the skill must ask before
+reading substantive history. The choices cover reachable Git and tracked
+history, repository-linked local Codex and Claude Code sessions, and opt-in
+reflog/unreachable commits, initialized submodules, tracked worktree changes,
+or non-ignored untracked files. Ignored files and external services are always
+excluded. Conversation association uses cwd/project metadata for the repository
+or a worktree sharing its Git common directory; unrelated conversations are
+never selected by searching their content.
+
+After approval, evidence-qualified model additions and new decision or attempt
+events are applied automatically through `project-context
+apply-reconstruction`. The command rejects stale base snapshots with exit
+status `3`, preserves existing intent and event bytes, and makes repeated
+semantic candidates a no-op. Canonical evidence records only provider, session
+ID, and record index, not transcript paths or transcript text.
+
+Packages produced from this source contain exactly the two top-level skill
+directories. Installation accepts only fresh, additive-companion, or fully
+identical states. If either installed skill differs from the verified package,
+or only the reconstruction skill exists, installation stops without changing
+the repository. Updating a differing installation is intentionally a separate
+task; there is no automatic upgrade path.
+
+The versioned public installation command above remains unchanged. Publishing
+the two-skill package, choosing a next version, and creating release assets are
+separate release work and are not performed by this source change.
+
 ## Supported Platforms
 
 Prebuilt CLI binaries are published for:
@@ -154,11 +189,14 @@ GitHub build-provenance attestations.
 
 ```text
 project-context/  Distributable skill files
+reconstruct-project-context/  Local-history reconstruction skill files
 cli/              Rust CLI source and CLI tests
 bin/              Secure installer, validators, and reproducible packaging tools
 tests/            Repository-level package and launcher tests
 LICENSE           Repository license
 ```
 
-The release package includes `project-context/` and the root `LICENSE`. It does
-not include `cli/`, `tests/`, repository build tools, or development artifacts.
+The package built from this source includes `project-context/`,
+`reconstruct-project-context/`, and a copy of the root `LICENSE` in each skill.
+It does not include `cli/`, `tests/`, repository build tools, or development
+artifacts.

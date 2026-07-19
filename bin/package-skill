@@ -28,19 +28,26 @@ repository_root=$(
 temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-package.XXXXXX")
 trap 'rm -rf "$temporary_root"' EXIT HUP INT TERM
 
-package_root="${temporary_root}/skill-package/project-context"
-mkdir -p "${package_root}/bin"
+package_directory="${temporary_root}/skill-package"
+package_root="${package_directory}/project-context"
+reconstruction_root="${package_directory}/reconstruct-project-context"
+mkdir -p "${package_root}/bin" "$reconstruction_root"
 cp "${repository_root}/project-context/SKILL.md" "${repository_root}/LICENSE" "$package_root/"
 cp -R "${repository_root}/project-context/agents" "$package_root/"
 cp -R "${repository_root}/project-context/assets" "$package_root/"
 cp "${repository_root}/project-context/bin/project-context" "${package_root}/bin/"
 chmod 755 "${package_root}/bin/project-context"
+cp "${repository_root}/reconstruct-project-context/SKILL.md" "${repository_root}/LICENSE" "$reconstruction_root/"
+cp -R "${repository_root}/reconstruct-project-context/agents" "$reconstruction_root/"
+cp -R "${repository_root}/reconstruct-project-context/references" "$reconstruction_root/"
+cp -R "${repository_root}/reconstruct-project-context/scripts" "$reconstruction_root/"
+chmod 755 "${reconstruction_root}/scripts/inventory_local_history.py"
 
-find "${temporary_root}/skill-package/project-context" -exec touch -t 197001010000 {} +
+find "$package_directory" -exec touch -t 197001010000 {} +
 manifest="${temporary_root}/manifest.txt"
 (
-  cd "${temporary_root}/skill-package"
-  LC_ALL=C find project-context -print | LC_ALL=C sort > "$manifest"
+  cd "$package_directory"
+  LC_ALL=C find project-context reconstruct-project-context -print | LC_ALL=C sort > "$manifest"
 )
 
 archive_name="project-context-skill-v${version}.tar.gz"
@@ -48,13 +55,13 @@ uncompressed="${temporary_root}/${archive_name%.gz}"
 archive="${temporary_root}/${archive_name}"
 if tar --version 2>/dev/null | grep -q 'GNU tar'; then
   (
-    cd "${temporary_root}/skill-package"
+    cd "$package_directory"
     tar --no-recursion --no-xattrs --owner=0 --group=0 --numeric-owner \
       -cf "$uncompressed" -T "$manifest"
   )
 else
   (
-    cd "${temporary_root}/skill-package"
+    cd "$package_directory"
     COPYFILE_DISABLE=1 tar --no-recursion --no-xattrs --uid 0 --gid 0 --uname root --gname root \
       -cf "$uncompressed" -T "$manifest"
   )

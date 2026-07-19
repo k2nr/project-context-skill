@@ -29,6 +29,7 @@ pub fn inspect_installation(
             report.warnings.extend(validation.warnings);
         }
         Err(StoreError::Invalid(validation)) => report.errors.extend(validation.errors),
+        Err(StoreError::Conflict(error)) => return Err(error),
         Err(StoreError::Environment(error)) => return Err(error),
     }
     if report.errors.is_empty() {
@@ -36,6 +37,7 @@ pub fn inspect_installation(
         inspect_model(&data.model, allowed_empty_operations, &mut report);
     }
     inspect_skill(root, &mut report);
+    inspect_reconstruction_skill(root, &mut report);
     inspect_agents(root, &mut report);
     inspect_tools(&mut report);
     report.errors.sort();
@@ -49,6 +51,7 @@ pub fn inspect_installation(
 fn store_error_message(error: StoreError) -> String {
     match error {
         StoreError::Invalid(report) => report.errors.join("; "),
+        StoreError::Conflict(message) => message,
         StoreError::Environment(message) => message,
     }
 }
@@ -120,7 +123,17 @@ fn inspect_skill(root: &Path, report: &mut DoctorReport) {
             ));
         }
     }
-    if let Err(error) = inspect_tree(&skill, &skill, report) {
+    let expected = [
+        "LICENSE",
+        "SKILL.md",
+        "agents/openai.yaml",
+        "assets/init/event.schema.json",
+        "assets/init/model.schema.json",
+        "assets/init/model.yaml",
+        "assets/install/AGENTS.fragment.md",
+        "bin/project-context",
+    ];
+    if let Err(error) = inspect_tree(&skill, &skill, &expected, report) {
         report.errors.push(error);
     }
     let launcher = skill.join("bin/project-context");
@@ -171,7 +184,62 @@ fn inspect_skill(root: &Path, report: &mut DoctorReport) {
     }
 }
 
-fn inspect_tree(path: &Path, root: &Path, report: &mut DoctorReport) -> Result<(), String> {
+fn inspect_reconstruction_skill(root: &Path, report: &mut DoctorReport) {
+    let errors_before = report.errors.len();
+    let skill = root.join(".agents/skills/reconstruct-project-context");
+    let expected = [
+        "LICENSE",
+        "SKILL.md",
+        "agents/openai.yaml",
+        "references/qualification.md",
+        "references/sources.md",
+        "scripts/inventory_local_history.py",
+    ];
+    for relative in expected {
+        if !skill.join(relative).is_file() {
+            report.errors.push(format!(
+                "installed skill file is missing or invalid: .agents/skills/reconstruct-project-context/{relative}"
+            ));
+        }
+    }
+    for relative in ["agents", "references", "scripts"] {
+        if !skill.join(relative).is_dir() {
+            report.errors.push(format!(
+                "installed skill directory is missing or invalid: .agents/skills/reconstruct-project-context/{relative}"
+            ));
+        }
+    }
+    if let Err(error) = inspect_tree(&skill, &skill, &expected, report) {
+        report.errors.push(error);
+    }
+    let inventory = skill.join("scripts/inventory_local_history.py");
+    #[cfg(unix)]
+    if inventory.is_file() {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(&inventory) {
+            Ok(metadata) if metadata.permissions().mode() & 0o111 != 0 => {}
+            Ok(_) => report
+                .errors
+                .push("installed reconstruction inventory script is not executable".to_owned()),
+            Err(error) => report.errors.push(format!(
+                "cannot inspect installed reconstruction inventory script: {error}"
+            )),
+        }
+    }
+    if report.errors.len() == errors_before {
+        report.checks.insert(
+            "skill.reconstruction_package".to_owned(),
+            "valid".to_owned(),
+        );
+    }
+}
+
+fn inspect_tree(
+    path: &Path,
+    root: &Path,
+    expected: &[&str],
+    report: &mut DoctorReport,
+) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect installed skill: {error}"))?;
     if metadata.file_type().is_symlink() {
@@ -187,7 +255,7 @@ fn inspect_tree(path: &Path, root: &Path, report: &mut DoctorReport) -> Result<(
         {
             let entry =
                 entry.map_err(|error| format!("cannot read installed skill entry: {error}"))?;
-            inspect_tree(&entry.path(), root, report)?;
+            inspect_tree(&entry.path(), root, expected, report)?;
         }
         return Ok(());
     }
@@ -210,16 +278,6 @@ fn inspect_tree(path: &Path, root: &Path, report: &mut DoctorReport) -> Result<(
         ));
     }
     let relative_name = relative.to_string_lossy();
-    let expected = [
-        "LICENSE",
-        "SKILL.md",
-        "agents/openai.yaml",
-        "assets/init/event.schema.json",
-        "assets/init/model.schema.json",
-        "assets/init/model.yaml",
-        "assets/install/AGENTS.fragment.md",
-        "bin/project-context",
-    ];
     if !expected.contains(&relative_name.as_ref()) {
         report.errors.push(format!(
             "installed skill contains an unexpected file: {}",

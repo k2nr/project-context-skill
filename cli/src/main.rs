@@ -5,11 +5,11 @@ mod store;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use output::{
-    OutputFormat, render_configure, render_context, render_doctor, render_event, render_init,
-    render_validation,
+    OutputFormat, render_configure, render_conflict, render_context, render_doctor, render_event,
+    render_init, render_reconstruction, render_validation,
 };
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use store::{AttemptInput, DecisionInput, StoreError};
 
@@ -95,6 +95,17 @@ enum Command {
         #[arg(long)]
         evidence: Vec<String>,
     },
+    /// Atomically apply a validated reconstruction of model and event history.
+    ApplyReconstruction {
+        #[arg(long)]
+        base_model: PathBuf,
+        #[arg(long)]
+        base_events: PathBuf,
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        events: PathBuf,
+    },
     /// Validate the nearest project-context store.
     Validate {
         /// Treat warnings as validation errors.
@@ -153,6 +164,7 @@ impl AttemptResult {
 enum AppError {
     Invalid(store::ValidationReport),
     Doctor(doctor::DoctorReport),
+    Conflict(String),
     Environment(String),
 }
 
@@ -160,6 +172,7 @@ impl From<StoreError> for AppError {
     fn from(error: StoreError) -> Self {
         match error {
             StoreError::Invalid(report) => Self::Invalid(report),
+            StoreError::Conflict(message) => Self::Conflict(message),
             StoreError::Environment(message) => Self::Environment(message),
         }
     }
@@ -171,6 +184,7 @@ fn main() -> ExitCode {
         Ok(output) => write_stdout(&output, 0),
         Err(AppError::Invalid(report)) => write_stdout(&render_validation(&report, cli.format), 1),
         Err(AppError::Doctor(report)) => write_stdout(&render_doctor(&report, cli.format), 1),
+        Err(AppError::Conflict(message)) => write_stdout(&render_conflict(&message, cli.format), 3),
         Err(AppError::Environment(message)) => {
             eprintln!("error: {message}");
             ExitCode::from(2)
@@ -296,6 +310,24 @@ fn run(cli: &Cli) -> Result<String, AppError> {
                 },
             )?;
             Ok(render_event(&event, cli.format))
+        }
+        Command::ApplyReconstruction {
+            base_model,
+            base_events,
+            model,
+            events,
+        } => {
+            let root = nearest_root()?;
+            let report = store::apply_reconstruction(
+                &root,
+                store::ReconstructionInput {
+                    base_model: base_model.clone(),
+                    base_events: base_events.clone(),
+                    model: model.clone(),
+                    events: events.clone(),
+                },
+            )?;
+            Ok(render_reconstruction(&report, cli.format))
         }
         Command::Validate { strict } => {
             let root = nearest_root()?;

@@ -37,6 +37,13 @@ fn install_skill_fixture(root: &Path) {
     let destination = root.join(".agents/skills/project-context");
     copy_tree(&repository.join("project-context"), &destination);
     fs::copy(repository.join("LICENSE"), destination.join("LICENSE")).expect("copy license");
+    let reconstruction = root.join(".agents/skills/reconstruct-project-context");
+    copy_tree(
+        &repository.join("reconstruct-project-context"),
+        &reconstruction,
+    );
+    fs::copy(repository.join("LICENSE"), reconstruction.join("LICENSE"))
+        .expect("copy reconstruction license");
     fs::copy(
         destination.join("assets/install/AGENTS.fragment.md"),
         root.join("AGENTS.md"),
@@ -175,6 +182,170 @@ fn configure_updates_only_explicit_model_fields_and_preserves_history() {
             .status
             .success()
     );
+}
+
+#[test]
+fn reconstruction_applies_atomically_and_is_idempotent() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    let context = directory.path().join(".project-context");
+    let base_model = directory.path().join("base-model.yaml");
+    let base_events = directory.path().join("base-events.jsonl");
+    let proposed_model = directory.path().join("proposed-model.yaml");
+    let proposed_events = directory.path().join("proposed-events.jsonl");
+    fs::copy(context.join("model.yaml"), &base_model).expect("copy base model");
+    fs::copy(context.join("events.jsonl"), &base_events).expect("copy base events");
+    let model = fs::read_to_string(&base_model)
+        .expect("read base model")
+        .replace(
+            "architecture: []",
+            concat!(
+                "architecture:\n",
+                "  - id: reconstructed-history\n",
+                "    statement: Preserve reconstructed repository intent.\n",
+                "    related_events:\n",
+                "      - candidate:decision"
+            ),
+        );
+    fs::write(&proposed_model, model).expect("write proposed model");
+    fs::write(
+        &proposed_events,
+        concat!(
+            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"candidate:decision\",",
+            "\"date\":\"2026-07-19\",\"subject\":\"history reconstruction\",",
+            "\"decision\":\"Preserve repository-linked local history.\",",
+            "\"reason\":\"It contains durable project intent.\",",
+            "\"evidence\":[\"conversation:codex:fixture#4\"]}\n"
+        ),
+    )
+    .expect("write proposed events");
+
+    let arguments = [
+        "apply-reconstruction",
+        "--base-model",
+        base_model.to_str().expect("base model path"),
+        "--base-events",
+        base_events.to_str().expect("base events path"),
+        "--model",
+        proposed_model.to_str().expect("proposed model path"),
+        "--events",
+        proposed_events.to_str().expect("proposed events path"),
+        "--format",
+        "json",
+    ];
+    let first = cli(directory.path(), &arguments);
+    assert!(first.status.success(), "{}", stdout(&first));
+    let report: Value = serde_json::from_slice(&first.stdout).expect("report JSON");
+    assert_eq!(report["model_changed"], true);
+    assert_eq!(report["events_added"], 1);
+    assert_eq!(report["duplicates_skipped"], 0);
+    assert_eq!(report["no_op"], false);
+    let original_events = fs::read(&base_events).expect("original events");
+    let applied_events = fs::read(context.join("events.jsonl")).expect("applied events");
+    assert!(applied_events.starts_with(&original_events));
+
+    fs::copy(context.join("model.yaml"), &base_model).expect("refresh base model");
+    fs::copy(context.join("events.jsonl"), &base_events).expect("refresh base events");
+    fs::copy(&base_model, &proposed_model).expect("reuse applied model");
+    let second = cli(directory.path(), &arguments);
+    assert!(second.status.success(), "{}", stdout(&second));
+    let report: Value = serde_json::from_slice(&second.stdout).expect("report JSON");
+    assert_eq!(report["events_added"], 0);
+    assert_eq!(report["duplicates_skipped"], 1);
+    assert_eq!(report["no_op"], true);
+}
+
+#[test]
+fn reconstruction_reports_base_conflicts_without_mutation() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    let context = directory.path().join(".project-context");
+    let base_model = directory.path().join("base-model.yaml");
+    let base_events = directory.path().join("base-events.jsonl");
+    let proposed_model = directory.path().join("proposed-model.yaml");
+    let proposed_events = directory.path().join("proposed-events.jsonl");
+    fs::copy(context.join("model.yaml"), &base_model).expect("copy base model");
+    fs::copy(context.join("events.jsonl"), &base_events).expect("copy base events");
+    fs::copy(&base_model, &proposed_model).expect("copy proposed model");
+    fs::write(&proposed_events, "").expect("empty proposed events");
+    assert!(
+        cli(
+            directory.path(),
+            &[
+                "add-attempt",
+                "--subject",
+                "concurrent mutation",
+                "--approach",
+                "Change the canonical event log.",
+                "--result",
+                "succeeded",
+                "--finding",
+                "The base snapshot is now stale.",
+            ],
+        )
+        .status
+        .success()
+    );
+    let before_model = fs::read(context.join("model.yaml")).expect("model before conflict");
+    let before_events = fs::read(context.join("events.jsonl")).expect("events before conflict");
+
+    let output = cli(
+        directory.path(),
+        &[
+            "apply-reconstruction",
+            "--base-model",
+            base_model.to_str().expect("base model path"),
+            "--base-events",
+            base_events.to_str().expect("base events path"),
+            "--model",
+            proposed_model.to_str().expect("proposed model path"),
+            "--events",
+            proposed_events.to_str().expect("proposed events path"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(fs::read(context.join("model.yaml")).unwrap(), before_model);
+    assert_eq!(
+        fs::read(context.join("events.jsonl")).unwrap(),
+        before_events
+    );
+}
+
+#[test]
+fn reconstruction_reports_invalid_proposed_data_as_exit_one() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    let context = directory.path().join(".project-context");
+    let base_model = directory.path().join("base-model.yaml");
+    let base_events = directory.path().join("base-events.jsonl");
+    let proposed_model = directory.path().join("proposed-model.yaml");
+    let proposed_events = directory.path().join("proposed-events.jsonl");
+    fs::copy(context.join("model.yaml"), &base_model).expect("copy base model");
+    fs::copy(context.join("events.jsonl"), &base_events).expect("copy base events");
+    fs::write(&proposed_model, "project: [invalid\n").expect("write invalid model");
+    fs::write(&proposed_events, "").expect("empty proposed events");
+
+    let output = cli(
+        directory.path(),
+        &[
+            "apply-reconstruction",
+            "--base-model",
+            base_model.to_str().expect("base model path"),
+            "--base-events",
+            base_events.to_str().expect("base events path"),
+            "--model",
+            proposed_model.to_str().expect("proposed model path"),
+            "--events",
+            proposed_events.to_str().expect("proposed events path"),
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("validation JSON");
+    assert_eq!(report["valid"], false);
 }
 
 #[test]

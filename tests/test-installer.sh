@@ -123,11 +123,158 @@ grep -Fq '<!-- project-context:managed:start -->' "${target_repository}/AGENTS.m
 grep -Fq 'id: installer-fixture' "${target_repository}/.project-context/model.yaml"
 grep -Fq 'description: Installer integration fixture.' "${target_repository}/.project-context/model.yaml"
 test -x "${target_repository}/.agents/skills/project-context/bin/project-context"
+test -x "${target_repository}/.agents/skills/reconstruct-project-context/scripts/inventory_local_history.py"
 
 rerun_output=$(run_installer "$target_repository" --format json)
 printf '%s\n' "$rerun_output" | validate_json
 printf '%s\n' "$rerun_output" | grep -Fq '"skill":"preserved-identical"'
+printf '%s\n' "$rerun_output" | grep -Fq '"reconstruction_skill":"preserved-identical"'
 printf '%s\n' "$rerun_output" | grep -Fq '"context":"preserved"'
+
+additive_repository="${test_root}/additive"
+mkdir "$additive_repository"
+git -C "$additive_repository" init -q
+cp -R "${target_repository}/.agents" "$additive_repository/.agents"
+rm -rf "${additive_repository}/.agents/skills/reconstruct-project-context"
+cp "${target_repository}/AGENTS.md" "$additive_repository/AGENTS.md"
+cp -R "${target_repository}/.project-context" "$additive_repository/.project-context"
+additive_output=$(run_installer "$additive_repository" --format json)
+printf '%s\n' "$additive_output" | validate_json
+printf '%s\n' "$additive_output" | grep -Fq '"skill":"preserved-identical"'
+printf '%s\n' "$additive_output" | grep -Fq '"reconstruction_skill":"installed"'
+test -x "${additive_repository}/.agents/skills/reconstruct-project-context/scripts/inventory_local_history.py"
+printf '\nlocal reconstruction difference\n' \
+  >> "${additive_repository}/.agents/skills/reconstruct-project-context/SKILL.md"
+set +e
+reconstruction_conflict_output=$(run_installer "$additive_repository" --format json 2>/dev/null)
+reconstruction_conflict_status=$?
+set -e
+[ "$reconstruction_conflict_status" -eq 3 ]
+printf '%s\n' "$reconstruction_conflict_output" | grep -Fq 'differs from the verified package'
+grep -Fq 'local reconstruction difference' \
+  "${additive_repository}/.agents/skills/reconstruct-project-context/SKILL.md"
+
+partial_repository="${test_root}/unsupported-partial"
+mkdir -p "${partial_repository}/.agents/skills"
+git -C "$partial_repository" init -q
+cp -R "${target_repository}/.agents/skills/reconstruct-project-context" \
+  "${partial_repository}/.agents/skills/reconstruct-project-context"
+set +e
+partial_output=$(run_installer "$partial_repository" \
+  --dry-run --format json \
+  --project-id partial \
+  --description 'Partial fixture.' \
+  --allow-empty build --allow-empty test --allow-empty lint --allow-empty format 2>/dev/null)
+partial_status=$?
+set -e
+[ "$partial_status" -eq 3 ]
+printf '%s\n' "$partial_output" | grep -Fq 'unsupported partial installation'
+[ ! -e "${partial_repository}/.agents/skills/project-context" ]
+
+rollback_repository="${test_root}/rollback"
+mkdir -p "${rollback_repository}/.agents/skills"
+git -C "$rollback_repository" init -q
+cp -R "${target_repository}/.agents/skills/project-context" \
+  "${rollback_repository}/.agents/skills/project-context"
+printf '# Rollback fixture\n' > "${rollback_repository}/AGENTS.md"
+(
+  cd "$rollback_repository"
+  "${repository_root}/cli/target/debug/project-context" init >/dev/null
+  "${repository_root}/cli/target/debug/project-context" configure \
+    --description 'Rollback fixture.' --build 'cargo build' >/dev/null
+)
+cp "${rollback_repository}/AGENTS.md" "${test_root}/rollback-agents.before"
+cp "${rollback_repository}/.project-context/model.yaml" "${test_root}/rollback-model.before"
+set +e
+rollback_output=$(run_installer "$rollback_repository" --format json 2>/dev/null)
+rollback_status=$?
+set -e
+[ "$rollback_status" -eq 2 ]
+printf '%s\n' "$rollback_output" | grep -Fq 'installation doctor reported incomplete configuration'
+cmp "${test_root}/rollback-agents.before" "${rollback_repository}/AGENTS.md"
+cmp "${test_root}/rollback-model.before" "${rollback_repository}/.project-context/model.yaml"
+[ ! -e "${rollback_repository}/.agents/skills/reconstruct-project-context" ]
+
+rollback_conflict_repository="${test_root}/rollback-conflict"
+mkdir "$rollback_conflict_repository"
+git -C "$rollback_conflict_repository" init -q
+set +e
+rollback_conflict_output=$(
+  PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT=content \
+    run_installer "$rollback_conflict_repository" \
+      --format json \
+      --project-id rollback-conflict \
+      --description 'Rollback conflict fixture.' \
+      --allow-empty build --allow-empty test --allow-empty lint --allow-empty format \
+      2>"${test_root}/rollback-conflict.stderr"
+)
+rollback_conflict_status=$?
+unset PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT
+set -e
+[ "$rollback_conflict_status" -eq 2 ]
+printf '%s\n' "$rollback_conflict_output" | grep -Fq 'injected post-write failure'
+grep -Fq 'rollback conflict' "${test_root}/rollback-conflict.stderr"
+grep -Fq 'externally changed during installation' "${rollback_conflict_repository}/AGENTS.md"
+[ ! -e "${rollback_conflict_repository}/.agents/skills/project-context" ]
+[ ! -e "${rollback_conflict_repository}/.agents/skills/reconstruct-project-context" ]
+[ ! -e "${rollback_conflict_repository}/.agents" ]
+[ ! -e "${rollback_conflict_repository}/.project-context" ]
+
+chmod_conflict_repository="${test_root}/rollback-chmod-conflict"
+mkdir "$chmod_conflict_repository"
+git -C "$chmod_conflict_repository" init -q
+set +e
+PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT=chmod \
+  run_installer "$chmod_conflict_repository" \
+    --format json \
+    --project-id rollback-chmod-conflict \
+    --description 'Rollback chmod conflict fixture.' \
+    --allow-empty build --allow-empty test --allow-empty lint --allow-empty format \
+    >"${test_root}/rollback-chmod.out" 2>"${test_root}/rollback-chmod.stderr"
+chmod_conflict_status=$?
+unset PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT
+set -e
+[ "$chmod_conflict_status" -eq 2 ]
+grep -Fq 'rollback conflict' "${test_root}/rollback-chmod.stderr"
+[ -f "${chmod_conflict_repository}/AGENTS.md" ]
+
+symlink_conflict_repository="${test_root}/rollback-symlink-conflict"
+mkdir "$symlink_conflict_repository"
+git -C "$symlink_conflict_repository" init -q
+set +e
+PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT=symlink \
+  run_installer "$symlink_conflict_repository" \
+    --format json \
+    --project-id rollback-symlink-conflict \
+    --description 'Rollback symlink conflict fixture.' \
+    --allow-empty build --allow-empty test --allow-empty lint --allow-empty format \
+    >"${test_root}/rollback-symlink.out" 2>"${test_root}/rollback-symlink.stderr"
+symlink_conflict_status=$?
+unset PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT
+set -e
+[ "$symlink_conflict_status" -eq 2 ]
+grep -Fq 'rollback conflict' "${test_root}/rollback-symlink.stderr"
+[ -L "${symlink_conflict_repository}/AGENTS.md" ]
+grep -Fq 'external target' "${symlink_conflict_repository}.external-agents-target"
+
+mode_repository="${test_root}/mode-conflict"
+mkdir "$mode_repository"
+git -C "$mode_repository" init -q
+cp -R "${target_repository}/.agents" "$mode_repository/.agents"
+cp -R "${target_repository}/.project-context" "$mode_repository/.project-context"
+cp "${target_repository}/AGENTS.md" "$mode_repository/AGENTS.md"
+mode_target="${mode_repository}/.agents/skills/reconstruct-project-context/SKILL.md"
+if [ "$(stat -f '%Lp' "$mode_target" 2>/dev/null || stat -c '%a' "$mode_target")" = 600 ]; then
+  chmod 644 "$mode_target"
+else
+  chmod 600 "$mode_target"
+fi
+set +e
+mode_output=$(run_installer "$mode_repository" --format json 2>/dev/null)
+mode_status=$?
+set -e
+[ "$mode_status" -eq 3 ]
+printf '%s\n' "$mode_output" | grep -Fq 'differs from the verified package'
 
 printf '\nlocal difference\n' >> "${target_repository}/.agents/skills/project-context/SKILL.md"
 set +e
