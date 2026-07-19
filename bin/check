@@ -20,6 +20,7 @@ check_lint() {
   cargo clippy --locked --manifest-path cli/Cargo.toml --all-targets -- -D warnings
   shellcheck \
     project-context/bin/project-context \
+    project-context/bin/update-project-context \
     bin/check \
     bin/install-project-context \
     bin/package-installer \
@@ -28,6 +29,7 @@ check_lint() {
     tests/*.sh
   for script_file in \
     project-context/bin/project-context \
+    project-context/bin/update-project-context \
     bin/check \
     bin/install-project-context \
     bin/package-installer \
@@ -49,6 +51,7 @@ check_test() {
   tests/test-package.sh
   tests/test-installer-package.sh
   tests/test-installer.sh
+  tests/test-update.sh
   tests/test-reconstruction.sh
   .agents/skills/project-context/bin/project-context validate --strict
 }

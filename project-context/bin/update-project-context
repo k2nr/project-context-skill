@@ -1,0 +1,576 @@
+#!/bin/sh
+set -eu
+
+PROJECT_CONTEXT_RELEASE_REPOSITORY="k2nr/project-context-skill"
+DEFAULT_RELEASE_BASE_URL="https://github.com/${PROJECT_CONTEXT_RELEASE_REPOSITORY}/releases/download"
+DEFAULT_LATEST_RELEASE_URL="https://github.com/${PROJECT_CONTEXT_RELEASE_REPOSITORY}/releases/latest"
+START_MARKER='<!-- project-context:managed:start -->'
+END_MARKER='<!-- project-context:managed:end -->'
+
+output_format=text
+dry_run=false
+temporary_root=
+writes_started=false
+committed=false
+skill_backup=
+reconstruction_backup=
+skill_staging=
+reconstruction_staging=
+skill_published=false
+reconstruction_published=false
+agents_published=false
+agents_after_mode=
+
+json_escape() {
+  printf '%s' "$1" | awk '
+    BEGIN { first=1 }
+    {
+      gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r")
+      if (!first) printf "\\n"
+      printf "%s", $0
+      first=0
+    }
+  '
+}
+
+fail() {
+  message=$1
+  if [ "$output_format" = json ]; then
+    printf '{"ok":false,"error":"%s"}\n' "$(json_escape "$message")"
+  else
+    printf 'update-project-context: %s\n' "$message" >&2
+  fi
+  exit 2
+}
+
+conflict() {
+  message=$1
+  if [ "$output_format" = json ]; then
+    printf '{"ok":false,"conflict":true,"error":"%s"}\n' "$(json_escape "$message")"
+  else
+    printf 'update-project-context: %s\n' "$message" >&2
+  fi
+  exit 3
+}
+
+usage() {
+  cat <<'EOF'
+usage: update-project-context [OPTIONS]
+
+Update the repository-installed Project Context skills to the latest verified release.
+
+Options:
+  --dry-run           Verify and report without modifying the repository
+  --format text|json  Select the report format (default: text)
+  --help              Show this help
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry_run=true; shift ;;
+    --format)
+      [ "$#" -ge 2 ] || fail "--format requires a value"
+      output_format=$2
+      case "$output_format" in text|json) ;; *) fail "--format must be text or json" ;; esac
+      shift 2
+      ;;
+    --help|-h) usage; exit 0 ;;
+    *) fail "unknown option: $1" ;;
+  esac
+done
+
+for required_command in awk chmod cmp cp curl diff find grep mkdir mktemp mv rm sed sh stat tar tr; do
+  command -v "$required_command" >/dev/null 2>&1 \
+    || fail "required command not found: $required_command"
+done
+if command -v sha256sum >/dev/null 2>&1; then
+  checksum_command=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+  checksum_command=shasum
+else
+  fail "sha256sum or shasum is required"
+fi
+
+if command -v git >/dev/null 2>&1 \
+  && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git_root=$(git rev-parse --show-toplevel) || fail "cannot resolve the Git repository root"
+  physical_git_root=$(CDPATH='' cd -- "$git_root" && pwd -P) \
+    || fail "cannot resolve the physical Git repository root"
+  [ "$(pwd -P)" = "$physical_git_root" ] || fail "run from the target repository root"
+fi
+
+destination=.agents/skills/project-context
+reconstruction_destination=.agents/skills/reconstruct-project-context
+launcher="${destination}/bin/project-context"
+[ ! -L .agents ] && [ -d .agents ] || conflict ".agents is missing, invalid, or symbolic"
+[ ! -L .agents/skills ] && [ -d .agents/skills ] \
+  || conflict ".agents/skills is missing, invalid, or symbolic"
+[ ! -L "$destination" ] && [ -d "$destination" ] \
+  || conflict "$destination is missing, invalid, or symbolic"
+[ ! -L "$reconstruction_destination" ] && [ -d "$reconstruction_destination" ] \
+  || conflict "$reconstruction_destination is missing, invalid, or symbolic"
+[ ! -L AGENTS.md ] && [ -f AGENTS.md ] \
+  || conflict "AGENTS.md is missing, invalid, or symbolic"
+[ ! -L .project-context ] && [ -d .project-context ] \
+  || conflict ".project-context is missing, invalid, or symbolic"
+[ -w . ] || fail "repository root is not writable; grant repository-scoped write permission"
+
+current_version=$(sed -n 's/^PROJECT_CONTEXT_VERSION="\([^"]*\)"/\1/p' "$launcher")
+case "$current_version" in
+  ''|*[!0-9.]*) conflict "installed launcher has an invalid version" ;;
+esac
+printf '%s\n' "$current_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+  || conflict "installed launcher version is not a supported semantic version"
+
+release_base_url=$DEFAULT_RELEASE_BASE_URL
+latest_release_url=$DEFAULT_LATEST_RELEASE_URL
+if [ "${PROJECT_CONTEXT_UPDATE_TESTING:-}" = 1 ]; then
+  release_base_url=${PROJECT_CONTEXT_RELEASE_BASE_URL:-$release_base_url}
+  latest_version=${PROJECT_CONTEXT_UPDATE_LATEST_VERSION:-}
+  [ -n "$latest_version" ] || fail "PROJECT_CONTEXT_UPDATE_LATEST_VERSION is required during updater tests"
+else
+  if [ -n "${PROJECT_CONTEXT_RELEASE_BASE_URL:-}" ] \
+    && [ "$PROJECT_CONTEXT_RELEASE_BASE_URL" != "$DEFAULT_RELEASE_BASE_URL" ]; then
+    fail "PROJECT_CONTEXT_RELEASE_BASE_URL is allowed only during updater tests"
+  fi
+  if [ -n "${PROJECT_CONTEXT_UPDATE_LATEST_VERSION:-}" ]; then
+    fail "PROJECT_CONTEXT_UPDATE_LATEST_VERSION is allowed only during updater tests"
+  fi
+  latest_effective_url=$(curl --fail --location --silent --show-error --retry 3 \
+    --proto '=https' --tlsv1.2 --output /dev/null --write-out '%{url_effective}' \
+    "$latest_release_url") || fail "cannot resolve the latest Project Context release"
+  latest_tag=${latest_effective_url##*/}
+  case "$latest_tag" in v*) latest_version=${latest_tag#v} ;; *) fail "latest release URL does not end in a version tag" ;; esac
+fi
+case "$latest_version" in
+  ''|*[!0-9.]*) fail "latest release has an invalid version" ;;
+esac
+printf '%s\n' "$latest_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
+  || fail "latest release is not a supported semantic version"
+
+if [ "$current_version" != "$latest_version" ]; then
+  awk -v current="$current_version" -v latest="$latest_version" 'BEGIN {
+    split(current, c, "."); split(latest, l, ".")
+    for (i=1; i<=3; i++) {
+      if ((l[i]+0) > (c[i]+0)) exit 0
+      if ((l[i]+0) < (c[i]+0)) exit 1
+    }
+    exit 1
+  }' || fail "latest release v${latest_version} is older than installed v${current_version}"
+fi
+
+case "$release_base_url" in
+  https://*) curl_protocol='=https' ;;
+  file://*)
+    [ "${PROJECT_CONTEXT_UPDATE_TESTING:-}" = 1 ] \
+      || fail "file release URLs are allowed only during updater tests"
+    curl_protocol='=https,file'
+    ;;
+  *) fail "release base URL must use HTTPS" ;;
+esac
+release_base_url=${release_base_url%/}
+
+path_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
+tree_manifest() {
+  tree_root=$1
+  manifest_path=$2
+  (
+    cd "$tree_root"
+    LC_ALL=C find . -print | LC_ALL=C sort | while IFS= read -r member; do
+      [ ! -L "$member" ] || exit 1
+      if [ -d "$member" ]; then member_type=d
+      elif [ -f "$member" ]; then member_type=f
+      else exit 1
+      fi
+      printf '%s %s %s\n' "$member_type" "$(path_mode "$member")" "$member"
+    done
+  ) > "$manifest_path"
+}
+
+trees_identical() {
+  left_tree=$1
+  right_tree=$2
+  identity_label=$3
+  diff -qr "$left_tree" "$right_tree" > "${temporary_root}/${identity_label}.diff" 2>&1 \
+    || return 1
+  tree_manifest "$left_tree" "${temporary_root}/${identity_label}.left" || return 1
+  tree_manifest "$right_tree" "${temporary_root}/${identity_label}.right" || return 1
+  cmp "${temporary_root}/${identity_label}.left" "${temporary_root}/${identity_label}.right" \
+    >/dev/null 2>&1
+}
+
+regular_file_matches() {
+  target_path=$1
+  expected_path=$2
+  expected_mode=$3
+  [ ! -L "$target_path" ] && [ -f "$target_path" ] \
+    && cmp "$target_path" "$expected_path" >/dev/null 2>&1 \
+    && [ "$(path_mode "$target_path")" = "$expected_mode" ]
+}
+
+original_umask=$(umask)
+umask 077
+temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-update.XXXXXX") \
+  || fail "cannot create a private temporary directory"
+
+cleanup() {
+  status=$1
+  trap - EXIT HUP INT TERM
+  rollback_conflict=false
+  if [ "$status" -ne 0 ] && [ "$writes_started" = true ] && [ "$committed" = false ]; then
+    if [ "$agents_published" = true ]; then
+      if regular_file_matches AGENTS.md "${temporary_root}/AGENTS.md.after" "$agents_after_mode"; then
+        cp -p "${temporary_root}/AGENTS.md.before" AGENTS.md || rollback_conflict=true
+      else
+        rollback_conflict=true
+      fi
+    fi
+    if [ "$reconstruction_published" = true ]; then
+      if trees_identical "$reconstruction_destination" "$latest_reconstruction" rollback-reconstruction; then
+        rm -rf "$reconstruction_destination" || rollback_conflict=true
+        if mv "$reconstruction_backup" "$reconstruction_destination"; then
+          reconstruction_backup=
+        else
+          rollback_conflict=true
+        fi
+      else
+        rollback_conflict=true
+      fi
+    elif [ -d "$reconstruction_backup" ]; then
+      if [ ! -e "$reconstruction_destination" ] && [ ! -L "$reconstruction_destination" ] \
+        && mv "$reconstruction_backup" "$reconstruction_destination"; then
+        reconstruction_backup=
+      else
+        rollback_conflict=true
+      fi
+    fi
+    if [ "$skill_published" = true ]; then
+      if trees_identical "$destination" "$latest_skill" rollback-project; then
+        rm -rf "$destination" || rollback_conflict=true
+        if mv "$skill_backup" "$destination"; then
+          skill_backup=
+        else
+          rollback_conflict=true
+        fi
+      else
+        rollback_conflict=true
+      fi
+    elif [ -d "$skill_backup" ]; then
+      if [ ! -e "$destination" ] && [ ! -L "$destination" ] \
+        && mv "$skill_backup" "$destination"; then
+        skill_backup=
+      else
+        rollback_conflict=true
+      fi
+    fi
+    if [ "$rollback_conflict" = true ]; then
+      printf 'update-project-context: rollback conflict; externally changed targets and backups were preserved\n' >&2
+    fi
+  fi
+  if [ "$rollback_conflict" = false ]; then
+    [ -z "$skill_backup" ] || [ ! -d "$skill_backup" ] || rm -rf "$skill_backup"
+    [ -z "$reconstruction_backup" ] || [ ! -d "$reconstruction_backup" ] || rm -rf "$reconstruction_backup"
+  fi
+  [ -z "$skill_staging" ] || [ ! -d "$skill_staging" ] || rm -rf "$skill_staging"
+  [ -z "$reconstruction_staging" ] || [ ! -d "$reconstruction_staging" ] \
+    || rm -rf "$reconstruction_staging"
+  [ -z "$temporary_root" ] || [ ! -d "$temporary_root" ] || rm -rf "$temporary_root"
+  umask "$original_umask"
+  exit "$status"
+}
+trap 'cleanup $?' EXIT
+trap 'cleanup 129' HUP
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
+
+gh_status=unavailable
+command -v gh >/dev/null 2>&1 && gh_status=available
+attestation_status=unavailable
+
+download_package() {
+  version=$1
+  label=$2
+  archive_name="project-context-skill-v${version}.tar.gz"
+  archive="${temporary_root}/${label}-${archive_name}"
+  checksum="${archive}.sha256"
+  asset_base="${release_base_url}/v${version}"
+  curl --fail --location --silent --show-error --retry 3 \
+    --proto "$curl_protocol" --tlsv1.2 --output "$archive" "${asset_base}/${archive_name}" \
+    || fail "cannot download ${archive_name}"
+  curl --fail --location --silent --show-error --retry 3 \
+    --proto "$curl_protocol" --tlsv1.2 --output "$checksum" "${asset_base}/${archive_name}.sha256" \
+    || fail "cannot download ${archive_name}.sha256"
+
+  checksum_line=$(sed -n '1p' "$checksum")
+  [ -n "$checksum_line" ] || fail "${archive_name} checksum file is empty"
+  [ "$(awk 'END { print NR+0 }' "$checksum")" -eq 1 ] \
+    || fail "${archive_name} checksum file must contain exactly one record"
+  set -f
+  # Deliberately split the checksum record into its digest and file name.
+  # shellcheck disable=SC2086
+  set -- $checksum_line
+  set +f
+  [ "$#" -eq 2 ] || fail "${archive_name} checksum record has an invalid format"
+  expected_checksum=$(printf '%s' "$1" | tr 'A-F' 'a-f')
+  printf '%s\n' "$expected_checksum" | grep -Eq '^[0-9a-f]{64}$' \
+    || fail "${archive_name} checksum digest has an invalid format"
+  checksum_file_name=$2
+  case "$checksum_file_name" in "*$archive_name") checksum_file_name=${checksum_file_name#\*} ;; esac
+  [ "$checksum_file_name" = "$archive_name" ] \
+    || fail "${archive_name} checksum record names an unexpected file"
+  if [ "$checksum_command" = sha256sum ]; then
+    actual_checksum=$(sha256sum "$archive") || fail "cannot calculate ${archive_name} SHA-256"
+  else
+    actual_checksum=$(shasum -a 256 "$archive") || fail "cannot calculate ${archive_name} SHA-256"
+  fi
+  actual_checksum=${actual_checksum%% *}
+  actual_checksum=$(printf '%s' "$actual_checksum" | tr 'A-F' 'a-f')
+  [ "$actual_checksum" = "$expected_checksum" ] \
+    || fail "${archive_name} SHA-256 verification failed"
+
+  if [ "${PROJECT_CONTEXT_UPDATE_TESTING:-}" = 1 ]; then
+    attestation_status=skipped-testing
+  elif [ "$gh_status" = available ]; then
+    gh attestation verify "$archive" --repo "$PROJECT_CONTEXT_RELEASE_REPOSITORY" \
+      > "${temporary_root}/${label}-attestation.log" 2>&1 \
+      || { sed -n '1,40p' "${temporary_root}/${label}-attestation.log" >&2; fail "GitHub artifact attestation verification failed for v${version}"; }
+    attestation_status=verified
+  fi
+
+  tar -tzf "$archive" > "${temporary_root}/${label}-members.txt" \
+    || fail "cannot list ${archive_name} members"
+  tar -tvzf "$archive" > "${temporary_root}/${label}-verbose-members.txt" \
+    || fail "cannot inspect ${archive_name} member types"
+  grep -Fxq 'project-context/' "${temporary_root}/${label}-members.txt" \
+    || fail "${archive_name} is missing project-context"
+  grep -Fxq 'reconstruct-project-context/' "${temporary_root}/${label}-members.txt" \
+    || fail "${archive_name} is missing reconstruct-project-context"
+  if grep -Eq '(^/|(^|/)\.\.(/|$))' "${temporary_root}/${label}-members.txt"; then
+    fail "${archive_name} contains an unsafe path"
+  fi
+  if awk -F/ '$1 != "project-context" && $1 != "reconstruct-project-context" { bad=1 } END { exit bad ? 0 : 1 }' \
+    "${temporary_root}/${label}-members.txt"; then
+    fail "${archive_name} contains an unexpected top-level entry"
+  fi
+  if awk '$1 !~ /^[-d]/ { bad=1 } END { exit bad ? 0 : 1 }' \
+    "${temporary_root}/${label}-verbose-members.txt"; then
+    fail "${archive_name} contains a symbolic link or unsupported member type"
+  fi
+  if grep -Eq '(^|/)(cli|tests?|target|\.git|\.github)(/|$)|\.rs$|/(Cargo\.(toml|lock)|rust-toolchain(\.toml)?)$' \
+    "${temporary_root}/${label}-members.txt"; then
+    fail "${archive_name} contains source, tests, or development artifacts"
+  fi
+
+  extract_root="${temporary_root}/${label}-extract"
+  mkdir "$extract_root"
+  private_umask=$(umask)
+  umask 022
+  tar -xzf "$archive" -C "$extract_root" || fail "cannot extract ${archive_name}"
+  umask "$private_umask"
+  package_root="${extract_root}/project-context"
+  reconstruction_root="${extract_root}/reconstruct-project-context"
+  for required_path in SKILL.md LICENSE agents/openai.yaml assets/init assets/install/AGENTS.fragment.md bin/project-context bin/update-project-context; do
+    [ -e "${package_root}/${required_path}" ] || fail "${archive_name} is missing ${required_path}"
+  done
+  for required_path in SKILL.md LICENSE agents/openai.yaml references/sources.md references/qualification.md scripts/inventory_local_history.py; do
+    [ -e "${reconstruction_root}/${required_path}" ] \
+      || fail "${archive_name} is missing reconstruct-project-context/${required_path}"
+  done
+  find "$package_root" -type l -print -quit | grep -q . \
+    && fail "${archive_name} contains a symbolic link"
+  find "$reconstruction_root" -type l -print -quit | grep -q . \
+    && fail "${archive_name} contains a reconstruction symbolic link"
+  chmod 755 "${package_root}/bin/project-context" "${package_root}/bin/update-project-context" \
+    "${reconstruction_root}/scripts/inventory_local_history.py" \
+    || fail "cannot normalize executable modes in ${archive_name}"
+  sh -n "${package_root}/bin/project-context" \
+    || fail "${archive_name} launcher failed shell syntax validation"
+  sh -n "${package_root}/bin/update-project-context" \
+    || fail "${archive_name} updater failed shell syntax validation"
+  packaged_version=$(sed -n 's/^PROJECT_CONTEXT_VERSION="\([^"]*\)"/\1/p' \
+    "${package_root}/bin/project-context")
+  [ "$packaged_version" = "$version" ] \
+    || fail "${archive_name} launcher version does not match its release"
+}
+
+download_package "$current_version" current
+current_skill="${temporary_root}/current-extract/project-context"
+current_reconstruction="${temporary_root}/current-extract/reconstruct-project-context"
+if [ "$latest_version" = "$current_version" ]; then
+  latest_skill=$current_skill
+  latest_reconstruction=$current_reconstruction
+else
+  download_package "$latest_version" latest
+  latest_skill="${temporary_root}/latest-extract/project-context"
+  latest_reconstruction="${temporary_root}/latest-extract/reconstruct-project-context"
+fi
+
+find "$destination" ! -type d ! -type f -print -quit | grep -q . \
+  && conflict "$destination contains an unsupported member type"
+find "$reconstruction_destination" ! -type d ! -type f -print -quit | grep -q . \
+  && conflict "$reconstruction_destination contains an unsupported member type"
+if ! trees_identical "$destination" "$current_skill" current-skill; then
+  sed -n '1,80p' "${temporary_root}/current-skill.diff" >&2
+  diff -u "${temporary_root}/current-skill.right" "${temporary_root}/current-skill.left" \
+    2>/dev/null | sed -n '1,80p' >&2 || true
+  conflict "$destination has local changes relative to v${current_version} and was not overwritten"
+fi
+if ! trees_identical "$reconstruction_destination" "$current_reconstruction" current-reconstruction; then
+  sed -n '1,80p' "${temporary_root}/current-reconstruction.diff" >&2
+  diff -u "${temporary_root}/current-reconstruction.right" \
+    "${temporary_root}/current-reconstruction.left" 2>/dev/null | sed -n '1,80p' >&2 || true
+  conflict "$reconstruction_destination has local changes relative to v${current_version} and was not overwritten"
+fi
+
+cp -p AGENTS.md "${temporary_root}/AGENTS.md.before" || fail "cannot snapshot AGENTS.md"
+agents_before_mode=$(path_mode AGENTS.md) || fail "cannot inspect AGENTS.md mode"
+start_count=$(awk -v marker="$START_MARKER" '{ line=$0; while ((position=index(line, marker)) > 0) { count++; line=substr(line, position + length(marker)) } } END { print count+0 }' AGENTS.md)
+end_count=$(awk -v marker="$END_MARKER" '{ line=$0; while ((position=index(line, marker)) > 0) { count++; line=substr(line, position + length(marker)) } } END { print count+0 }' AGENTS.md)
+[ "$start_count" -eq 1 ] && [ "$end_count" -eq 1 ] \
+  || conflict "AGENTS.md has malformed, missing, or duplicate managed markers"
+awk -v start="$START_MARKER" -v end="$END_MARKER" '
+  $0 == start { capture=1 }
+  capture { print }
+  $0 == end { capture=0; complete=1 }
+  END { exit complete ? 0 : 1 }
+' AGENTS.md > "${temporary_root}/AGENTS.fragment.current" \
+  || conflict "AGENTS.md managed block is malformed"
+cmp "${temporary_root}/AGENTS.fragment.current" "${current_skill}/assets/install/AGENTS.fragment.md" \
+  >/dev/null 2>&1 || conflict "AGENTS.md managed block has local changes and was not overwritten"
+awk -v start="$START_MARKER" -v end="$END_MARKER" '
+  NR == FNR { fragment = fragment $0 ORS; next }
+  $0 == start { printf "%s", fragment; replacing=1; next }
+  replacing && $0 == end { replacing=0; next }
+  !replacing { print }
+' "${latest_skill}/assets/install/AGENTS.fragment.md" AGENTS.md > "${temporary_root}/AGENTS.md.next"
+chmod "$agents_before_mode" "${temporary_root}/AGENTS.md.next" \
+  || fail "cannot preserve AGENTS.md mode"
+
+run_launcher() {
+  selected_launcher=$1
+  shift
+  if [ "${PROJECT_CONTEXT_UPDATE_TESTING:-}" = 1 ]; then
+    PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
+    PROJECT_CONTEXT_RELEASE_BASE_URL="$release_base_url" \
+    PROJECT_CONTEXT_CACHE_DIR="${temporary_root}/cli-cache" \
+      "$selected_launcher" "$@"
+  else
+    "$selected_launcher" "$@"
+  fi
+}
+run_launcher "$launcher" validate --strict > "${temporary_root}/validate-before.log" 2>&1 \
+  || { sed -n '1,120p' "${temporary_root}/validate-before.log" >&2; fail "existing .project-context failed strict validation and was preserved"; }
+cp -R .project-context "${temporary_root}/project-context.before" \
+  || fail "cannot snapshot .project-context"
+
+if [ "$current_version" = "$latest_version" ]; then
+  skill_action=already-current
+  reconstruction_action=already-current
+  agents_action=preserved
+  validation_status=passed
+elif [ "$dry_run" = true ]; then
+  skill_action=planned-update
+  reconstruction_action=planned-update
+  agents_action=planned-update
+  validation_status=not-run
+else
+  skill_action=updated
+  reconstruction_action=updated
+  agents_action=updated
+  skill_staging=".agents/skills/.project-context.update.$$"
+  reconstruction_staging=".agents/skills/.reconstruct-project-context.update.$$"
+  skill_backup=".agents/skills/.project-context.backup.$$"
+  reconstruction_backup=".agents/skills/.reconstruct-project-context.backup.$$"
+  for private_path in "$skill_staging" "$reconstruction_staging" "$skill_backup" "$reconstruction_backup"; do
+    [ ! -e "$private_path" ] && [ ! -L "$private_path" ] \
+      || fail "private update path already exists: $private_path"
+  done
+  private_umask=$(umask)
+  umask 022
+  cp -R "$latest_skill" "$skill_staging" || fail "cannot stage project-context update"
+  cp -R "$latest_reconstruction" "$reconstruction_staging" \
+    || fail "cannot stage reconstruct-project-context update"
+  umask "$private_umask"
+  chmod 755 "${skill_staging}/bin/project-context" "${skill_staging}/bin/update-project-context" \
+    "${reconstruction_staging}/scripts/inventory_local_history.py" \
+    || fail "cannot set staged executable modes"
+  trees_identical "$destination" "$current_skill" pre-publish-skill \
+    || conflict "$destination changed during update preflight"
+  trees_identical "$reconstruction_destination" "$current_reconstruction" pre-publish-reconstruction \
+    || conflict "$reconstruction_destination changed during update preflight"
+  regular_file_matches AGENTS.md "${temporary_root}/AGENTS.md.before" "$agents_before_mode" \
+    || conflict "AGENTS.md changed during update preflight"
+
+  writes_started=true
+  mv "$destination" "$skill_backup" || fail "cannot preserve the installed project-context skill"
+  if [ "${PROJECT_CONTEXT_UPDATE_TESTING:-}" = 1 ] \
+    && [ "${PROJECT_CONTEXT_UPDATE_INJECT_FAILURE:-}" = after-skill-backup ]; then
+    fail "injected failure after preserving the installed skill"
+  fi
+  mv "$skill_staging" "$destination" || fail "cannot publish the project-context update"
+  skill_published=true
+  mv "$reconstruction_destination" "$reconstruction_backup" \
+    || fail "cannot preserve the installed reconstruction skill"
+  mv "$reconstruction_staging" "$reconstruction_destination" \
+    || fail "cannot publish the reconstruction skill update"
+  reconstruction_published=true
+  cp -p "${temporary_root}/AGENTS.md.next" "${temporary_root}/AGENTS.md.publish" \
+    || fail "cannot stage AGENTS.md update"
+  mv "${temporary_root}/AGENTS.md.publish" AGENTS.md || fail "cannot publish AGENTS.md update"
+  agents_published=true
+  cp -p AGENTS.md "${temporary_root}/AGENTS.md.after" || fail "cannot snapshot updated AGENTS.md"
+  agents_after_mode=$(path_mode AGENTS.md) || fail "cannot inspect updated AGENTS.md mode"
+
+  if [ "${PROJECT_CONTEXT_UPDATE_TESTING:-}" = 1 ] \
+    && [ "${PROJECT_CONTEXT_UPDATE_INJECT_FAILURE:-}" = 1 ]; then
+    fail "injected post-update failure"
+  fi
+
+  updated_launcher="${destination}/bin/project-context"
+  run_launcher "$updated_launcher" validate --strict > "${temporary_root}/validate-after.log" 2>&1 \
+    || { sed -n '1,120p' "${temporary_root}/validate-after.log" >&2; fail "updated installation failed strict validation"; }
+  run_launcher "$updated_launcher" doctor --installation --format json \
+    --allow-empty build --allow-empty test --allow-empty lint --allow-empty format \
+    > "${temporary_root}/doctor-after.log" 2>&1 \
+    || { sed -n '1,160p' "${temporary_root}/doctor-after.log" >&2; fail "updated installation doctor reported an error"; }
+  diff -qr .project-context "${temporary_root}/project-context.before" \
+    > "${temporary_root}/context-preservation.diff" 2>&1 \
+    || fail ".project-context changed during skill update"
+  rm -rf "$skill_backup" "$reconstruction_backup"
+  skill_backup=
+  reconstruction_backup=
+  validation_status=passed
+  committed=true
+fi
+
+if [ "$output_format" = json ]; then
+  printf '{\n'
+  printf '  "ok": true,\n'
+  printf '  "current_version": "%s",\n' "$current_version"
+  printf '  "latest_version": "%s",\n' "$latest_version"
+  printf '  "dry_run": %s,\n' "$dry_run"
+  printf '  "verification": {"checksum":"verified","attestation":"%s","archives":"verified"},\n' "$attestation_status"
+  printf '  "actions": {"skill":"%s","reconstruction_skill":"%s","agents":"%s","context":"preserved"},\n' \
+    "$skill_action" "$reconstruction_action" "$agents_action"
+  printf '  "validation": "%s"\n' "$validation_status"
+  printf '}\n'
+else
+  printf 'Project Context update\n'
+  printf 'installed: v%s\n' "$current_version"
+  printf 'latest: v%s\n' "$latest_version"
+  printf 'checksum: verified\n'
+  printf 'attestation: %s\n' "$attestation_status"
+  printf 'skill: %s\n' "$skill_action"
+  printf 'reconstruction skill: %s\n' "$reconstruction_action"
+  printf 'AGENTS.md: %s\n' "$agents_action"
+  printf '.project-context: preserved\n'
+  printf 'strict validation: %s\n' "$validation_status"
+fi

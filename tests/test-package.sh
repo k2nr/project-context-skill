@@ -53,6 +53,7 @@ project-context/assets/install/
 project-context/assets/install/AGENTS.fragment.md
 project-context/bin/
 project-context/bin/project-context
+project-context/bin/update-project-context
 reconstruct-project-context/
 reconstruct-project-context/LICENSE
 reconstruct-project-context/SKILL.md
@@ -82,8 +83,10 @@ tar -xzf "$archive" -C "$extract_root"
 package_root="${extract_root}/project-context"
 reconstruction_root="${extract_root}/reconstruct-project-context"
 [ -x "${package_root}/bin/project-context" ]
+[ -x "${package_root}/bin/update-project-context" ]
 [ -x "${reconstruction_root}/scripts/inventory_local_history.py" ]
 sh -n "${package_root}/bin/project-context"
+sh -n "${package_root}/bin/update-project-context"
 "$repository_root/bin/validate-skill" "$package_root"
 "$repository_root/bin/validate-skill" "$reconstruction_root"
 cmp "$repository_root/LICENSE" "${package_root}/LICENSE"

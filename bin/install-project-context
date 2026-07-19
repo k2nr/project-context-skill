@@ -437,7 +437,7 @@ mkdir "$extract_root"
 tar -xzf "$archive" -C "$extract_root" || fail "cannot extract verified archive"
 package_root="${extract_root}/project-context"
 reconstruction_root="${extract_root}/reconstruct-project-context"
-for required_path in SKILL.md LICENSE agents/openai.yaml assets/init assets/install/AGENTS.fragment.md bin/project-context; do
+for required_path in SKILL.md LICENSE agents/openai.yaml assets/init assets/install/AGENTS.fragment.md bin/project-context bin/update-project-context; do
   [ -e "${package_root}/${required_path}" ] \
     || fail "verified package is missing ${required_path}"
 done
@@ -449,12 +449,14 @@ find "$package_root" -type l -print -quit | grep -q . \
   && fail "extracted package contains a symbolic link"
 find "$reconstruction_root" -type l -print -quit | grep -q . \
   && fail "extracted reconstruction package contains a symbolic link"
-chmod 755 "${package_root}/bin/project-context" \
+chmod 755 "${package_root}/bin/project-context" "${package_root}/bin/update-project-context" \
   || fail "cannot make the installed launcher executable"
 chmod 755 "${reconstruction_root}/scripts/inventory_local_history.py" \
   || fail "cannot make the reconstruction inventory executable"
 sh -n "${package_root}/bin/project-context" \
   || fail "installed launcher failed the shell syntax check"
+sh -n "${package_root}/bin/update-project-context" \
+  || fail "installed updater failed the shell syntax check"
 if [ "$standard_validator_status" = available ]; then
   python3 "$standard_validator_path" "$package_root" \
     > "${temporary_root}/standard-validator.log" 2>&1 \
@@ -595,6 +597,8 @@ else
     cp -R "$package_root" "$skill_staging" || fail "cannot stage the installed skill"
     chmod 755 "${skill_staging}/bin/project-context" \
       || fail "cannot set the staged launcher executable"
+    chmod 755 "${skill_staging}/bin/update-project-context" \
+      || fail "cannot set the staged updater executable"
     mv "$skill_staging" "$destination" || fail "cannot publish the installed skill"
     skill_staging=
     skill_published=true

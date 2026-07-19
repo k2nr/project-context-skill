@@ -77,6 +77,23 @@ layout, compares an existing installation, and validates managed-marker shape.
 It never overwrites a differing installed skill. Exit status `3` denotes a
 local-content or managed-marker conflict that requires human direction.
 
+## Update an Installed Project
+
+Ask the coding agent in the target repository to run:
+
+```text
+$project-context update
+```
+
+The skill first runs its repository-local updater as a dry run and then applies
+the update when there is no conflict. The updater resolves the latest published
+GitHub Release, verifies checksums and available attestations for both the
+installed version and target version, and refuses to replace locally modified
+skill files or a modified managed `AGENTS.md` block. It transactionally updates
+both installed skills and the managed block, validates the result, and preserves
+the complete `.project-context` directory byte-for-byte. A failed update rolls
+back the managed files; exit status `3` requires human direction.
+
 `--dry-run` downloads and verifies release assets but does not modify the
 repository. The JSON report includes network and repository write preflight,
 optional `gh`, `shellcheck`, and standard-validator availability, planned or
@@ -105,7 +122,8 @@ After installation, the target repository contains:
 │           │   └── install/
 │           │       └── AGENTS.fragment.md
 │           └── bin/
-│               └── project-context
+│               ├── project-context
+│               └── update-project-context
 └── .project-context/
     ├── .lock
     ├── model.yaml
@@ -162,8 +180,8 @@ Packages produced from this source contain exactly the two top-level skill
 directories. Installation accepts only fresh, additive-companion, or fully
 identical states. If either installed skill differs from the verified package,
 or only the reconstruction skill exists, installation stops without changing
-the repository. Updating a differing installation is intentionally a separate
-task; there is no automatic upgrade path.
+the repository. Explicit `$project-context update` is the upgrade path; it
+likewise stops rather than overwriting local skill changes.
 
 The versioned public installation command above remains unchanged. Publishing
 the two-skill package, choosing a next version, and creating release assets are

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+# The source checkout keeps the distributable updater canonical in project-context/.
+exec project-context/bin/update-project-context "$@"

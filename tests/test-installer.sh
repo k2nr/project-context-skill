@@ -131,6 +131,7 @@ grep -Fq '<!-- project-context:managed:start -->' "${target_repository}/AGENTS.m
 grep -Fq 'id: installer-fixture' "${target_repository}/.project-context/model.yaml"
 grep -Fq 'description: Installer integration fixture.' "${target_repository}/.project-context/model.yaml"
 test -x "${target_repository}/.agents/skills/project-context/bin/project-context"
+test -x "${target_repository}/.agents/skills/project-context/bin/update-project-context"
 test -x "${target_repository}/.agents/skills/reconstruct-project-context/scripts/inventory_local_history.py"
 
 rerun_output=$(run_installer "$target_repository" --format json)

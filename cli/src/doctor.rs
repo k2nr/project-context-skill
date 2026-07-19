@@ -108,6 +108,7 @@ fn inspect_skill(root: &Path, report: &mut DoctorReport) {
         "assets/init/model.yaml",
         "assets/install/AGENTS.fragment.md",
         "bin/project-context",
+        "bin/update-project-context",
     ];
     for relative in required_files {
         if !skill.join(relative).is_file() {
@@ -132,6 +133,7 @@ fn inspect_skill(root: &Path, report: &mut DoctorReport) {
         "assets/init/model.yaml",
         "assets/install/AGENTS.fragment.md",
         "bin/project-context",
+        "bin/update-project-context",
     ];
     if let Err(error) = inspect_tree(&skill, &skill, &expected, report) {
         report.errors.push(error);
@@ -175,6 +177,34 @@ fn inspect_skill(root: &Path, report: &mut DoctorReport) {
             report
                 .errors
                 .push("installed project-context launcher failed sh -n".to_owned());
+        }
+    }
+    let updater = skill.join("bin/update-project-context");
+    #[cfg(unix)]
+    if updater.is_file() {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(&updater) {
+            Ok(metadata) if metadata.permissions().mode() & 0o111 != 0 => {}
+            Ok(_) => report
+                .errors
+                .push("installed project-context updater is not executable".to_owned()),
+            Err(error) => report
+                .errors
+                .push(format!("cannot inspect installed updater: {error}")),
+        }
+    }
+    if updater.is_file() {
+        let syntax = Command::new("sh")
+            .arg("-n")
+            .arg(&updater)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !syntax.is_ok_and(|status| status.success()) {
+            report
+                .errors
+                .push("installed project-context updater failed sh -n".to_owned());
         }
     }
     if report.errors.len() == errors_before {

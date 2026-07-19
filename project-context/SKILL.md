@@ -29,6 +29,23 @@ Run commands from the repository root with the project-local launcher:
 `--max-tokens` bounds successful formatted output to four UTF-8 bytes per
 approximate token. Increase it if the required packet cannot fit.
 
+## Update Project Context
+
+When explicitly invoked as `$project-context update`, run the updater from the
+repository root. First perform a dry run, then run the update when it reports no
+conflict:
+
+```bash
+.agents/skills/project-context/bin/update-project-context --dry-run --format json
+.agents/skills/project-context/bin/update-project-context --format json
+```
+
+The updater resolves the latest GitHub Release, verifies the installed and
+target skill archives, and updates both repository-local skills plus the managed
+`AGENTS.md` block. It preserves `.project-context` byte-for-byte. Exit code `3`
+means the installed skills or managed block contain local changes; stop without
+overwriting them and report the conflict.
+
 ## Maintain Context
 
 1. Follow current intent unless the requested work intentionally changes it.
