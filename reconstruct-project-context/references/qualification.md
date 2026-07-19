@@ -2,13 +2,26 @@
 
 ## Model merge
 
-Use the base model as authoritative.
+Use the base model only as a non-destructive merge boundary, not as truth or evidence. Extract and
+qualify the complete candidate set before semantically inspecting the base. For an explicitly
+authorized from-scratch reconstruction, initialize an empty canonical store before collection.
 
 - Preserve every existing principle, architecture entry, behavior, constraint, extension, non-empty project field, and non-empty operation category.
 - Fill a missing description or empty operation category only with direct evidence.
 - Append only new, non-conflicting model entries with stable, descriptive IDs.
 - Do not resolve contradictions by rewriting the base. Preserve and report them.
 - Link model entries only to event candidates that survive deduplication.
+
+## Candidate completeness
+
+Record coverage proves only that every source received a disposition. It does not prove that every
+important choice was extracted. Classify every direct-user entry in `decision-coverage.jsonl`, trace
+short approvals and corrections to the surrounding proposal and rationale, and run
+`verify-candidates` before apply. Every entry classified as `decision` must appear in candidate event
+evidence through its declared `candidate:` ID, and its `rationale` must equal that candidate
+Decision's reason after whitespace normalization. Do not downgrade an explicit choice to `model`
+merely because the selected implementation is recoverable from code; the unrecoverable reason still
+belongs in a Decision.
 
 ## Decisions
 

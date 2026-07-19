@@ -9,6 +9,17 @@
 
 External services are never sources. Do not call GitHub, Slack, Notion, email, web search, or network APIs.
 
+## Canonical-data blindness
+
+Current and historical `.project-context/model.yaml` and `.project-context/events.jsonl` are never
+reconstruction sources. Git patches, tracked-path indexes, worktree patches, and untracked snapshots
+exclude them. Non-user conversation records that materialize their contents are redacted during
+collection. A direct user message may still discuss the desired behavior or naming of Project
+Context; treat the user's statement as conversation evidence, not the canonical file as evidence.
+
+The base snapshots used by `apply-reconstruction` are opaque concurrency and preservation inputs.
+Do not open or semantically inspect them during source review or candidate extraction.
+
 ## Repository association
 
 Accept a conversation only when its metadata cwd or project path resolves to the current repository root, or when it resolves to a worktree with the same `git rev-parse --git-common-dir` result. Resolve paths lexically and through the filesystem where possible. A mention of the repository in a message is not association evidence.

@@ -5,7 +5,8 @@ description: Reconstruct durable project-context model entries and decision or a
 
 # Reconstruct Project Context
 
-Recover durable intent from local history without importing transcripts or guesses.
+Recover durable intent from local history without importing transcripts, guesses, or prior
+Project Context conclusions as ground truth.
 
 ## Required reading
 
@@ -33,7 +34,10 @@ Never infer consent from invoking this skill. Skip the question only when the us
    ```
 
 3. Complete the scope gate when required. Do not access external services or the network.
-4. Create a mode-0700 temporary directory outside the repository. Copy the canonical `model.yaml` and `events.jsonl` into it as immutable base snapshots.
+4. Create a mode-0700 temporary directory outside the repository. Copy the canonical `model.yaml`
+   and `events.jsonl` into it as opaque immutable base snapshots. Never open, print, summarize, or
+   use their current or historical contents as reconstruction evidence. They exist only for
+   preservation and concurrent-change detection during apply.
 5. Run `collect` with `--include-git`, `--include-conversations`, or both according to the approved base sources, plus only the approved optional flags:
 
    ```sh
@@ -43,7 +47,24 @@ Never infer consent from invoking this skill. Skip the question only when the us
    ```
 
    Omit either base-source flag unless that source was approved. Treat the selected Git and conversation source list in `summary.json` as frozen for this run.
-6. Review history in two passes: first chronologically classify every `pending` commit, conversation record, and selected untracked file; then inspect relevant topics in depth. Change every coverage item to `analyzed`, `excluded`, or `unavailable`, with a reason for the latter two. Verify that no pending or unreconciled item remains:
+6. Review history in two passes: first chronologically classify every `pending` commit,
+   conversation record, and selected untracked file; then inspect relevant topics in depth. Change
+   every ordinary coverage item to `analyzed`, `excluded`, or `unavailable`, with a reason for the
+   latter two.
+
+   Independently classify every entry in `decision-coverage.jsonl`. These entries represent direct
+   user messages and prevent a structurally complete but low-recall review:
+
+   - `decision`: a durable choice whose supporting rationale must be traced through the surrounding
+     exchange, summarized in `rationale`, and linked through `candidate` to the exact candidate
+     Decision that repeats that rationale and includes this source as evidence;
+   - `model`: durable current intent that belongs in the model but lacks a reason-qualified Decision;
+   - `excluded`: not durable project intent, with a specific reason;
+   - `unavailable`: the decision signal cannot be evaluated, with a specific reason.
+
+   Do not bulk-exclude assistant or tool records before resolving short acceptances, corrections,
+   quoted proposals, and references such as "adopt all" against their neighboring context. Verify
+   that no pending or unreconciled item remains:
 
    ```sh
    python3 .agents/skills/reconstruct-project-context/scripts/inventory_local_history.py \
@@ -51,7 +72,18 @@ Never infer consent from invoking this skill. Skip the question only when the us
    ```
 
    Do not construct candidates unless verification succeeds.
-7. Build a complete proposed model from the base model and a JSONL file containing only new candidate events. Follow the qualification and merge rules exactly.
+7. Build the complete independent candidate set from approved evidence, without consulting the base
+   model or base events. Follow the qualification rules exactly. Write the proposed integrated model
+   only after candidate extraction is complete, using the opaque base solely as a preservation
+   boundary. Then require every `decision` signal to be represented in candidate event evidence:
+
+   ```sh
+   python3 .agents/skills/reconstruct-project-context/scripts/inventory_local_history.py \
+     verify-candidates --inventory "$temporary/inventory" \
+     --events "$temporary/new-events.jsonl"
+   ```
+
+   A passing record-coverage check is not a candidate-completeness check; both commands must pass.
 8. Apply once through the concurrency-safe CLI:
 
    ```sh
@@ -68,6 +100,9 @@ Never infer consent from invoking this skill. Skip the question only when the us
 
 - Include only Codex or Claude Code sessions whose metadata links them to the repository root or a worktree sharing its Git common directory. Never search unrelated conversation content to establish relevance.
 - Always exclude ignored files. Read non-ignored untracked files only when explicitly selected.
+- Never use current or historical `.project-context/model.yaml` or
+  `.project-context/events.jsonl` content as evidence. The inventory removes those Git paths and
+  redacts non-user conversation records that materialize them.
 - Never save transcript text, secrets, absolute transcript paths, routine failures, or inferred rationale in canonical data.
 - Express conversation evidence only as `conversation:<provider>:<session-id>#<record-index>`.
 - Treat CLI exit 3 as a base-state conflict. Do not retry against a new base without reporting the conflict and re-evaluating the candidates.

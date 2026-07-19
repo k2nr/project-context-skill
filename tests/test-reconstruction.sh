@@ -18,7 +18,10 @@ git -C "$fixture" config user.name Fixture
 git -C "$fixture" config user.email fixture@example.invalid
 printf 'first\n' > "${fixture}/source.txt"
 printf 'ignored.log\n' > "${fixture}/.gitignore"
-git -C "$fixture" add source.txt .gitignore
+mkdir -p "${fixture}/.project-context"
+printf 'historical-model-must-not-be-materialized\n' > "${fixture}/.project-context/model.yaml"
+printf 'historical-events-must-not-be-materialized\n' > "${fixture}/.project-context/events.jsonl"
+git -C "$fixture" add source.txt .gitignore .project-context
 git -C "$fixture" commit -qm 'Add source'
 git -C "$fixture" tag initial
 git -C "$fixture" checkout -qb topic
@@ -39,6 +42,7 @@ unreachable=$(git -C "$fixture" rev-parse HEAD)
 git -C "$fixture" reset -q --hard HEAD~1
 git -C "$fixture" reflog expire --expire=now --all
 printf 'worktree\n' >> "${fixture}/renamed.txt"
+printf 'current-model-must-not-be-materialized\n' > "${fixture}/.project-context/model.yaml"
 printf 'untracked\n' > "${fixture}/visible.txt"
 printf 'ignored\n' > "${fixture}/ignored.log"
 
@@ -60,7 +64,8 @@ session_id=codex-related
 session_file="${home}/.codex/sessions/${session_id}.jsonl"
 printf '%s\n' \
   "{\"type\":\"session_meta\",\"payload\":{\"session_id\":\"${session_id}\",\"cwd\":\"${worktree}\",\"base_instructions\":{\"sentinel\":\"must-not-be-materialized\"}}}" \
-  '{"type":"message","payload":{"role":"user","content":"durable choice"}}' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Use a local binary because target repositories must not need build tools."}]}}' \
+  '{"type":"response_item","payload":{"type":"function_call_output","output":".project-context/model.yaml contained conversation-canonical-must-not-be-materialized"}}' \
   'malformed' > "$session_file"
 python3 -c 'import sys; print("{\"type\":\"message\",\"payload\":{\"content\":\"" + "x" * (2 * 1024 * 1024 + 32) + "\"}}")' \
   >> "$session_file"
@@ -137,11 +142,17 @@ HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_l
   --include-worktree --include-untracked >/dev/null
 grep -Fq "$unreachable" "${inventory}/commits.jsonl"
 grep -Fq '"repository":"dependency"' "${inventory}/commits.jsonl"
-grep -Fq 'conversation:codex:codex-related#2' "${inventory}/conversation-coverage.jsonl"
+grep -Fq 'conversation:codex:codex-related#3' "${inventory}/conversation-coverage.jsonl"
 grep -Fq '"status":"unavailable"' "${inventory}/conversation-coverage.jsonl"
+grep -Fq 'conversation:codex:codex-related#1' "${inventory}/decision-coverage.jsonl"
+grep -Fq 'canonical-context-artifact-redacted' "${inventory}/conversations.jsonl"
 grep -Fq 'visible.txt' "${inventory}/untracked.jsonl"
 if grep -Fq 'ignored.log' "${inventory}/untracked.jsonl"; then
   printf 'ignored file was included in reconstruction inventory\n' >&2
+  exit 1
+fi
+if grep -ERq 'historical-(model|events)-must-not-be-materialized|current-model-must-not-be-materialized|conversation-canonical-must-not-be-materialized' "$inventory"; then
+  printf 'canonical Project Context content was included in reconstruction evidence\n' >&2
   exit 1
 fi
 python3 - "$inventory" <<'PY'
@@ -152,6 +163,10 @@ coverage = [json.loads(line) for line in (root / "conversation-coverage.jsonl").
 assert len(coverage) == summary["counts"]["conversation_records"]
 assert "pending" in {item["status"] for item in coverage}
 assert sum(item["records"] for item in summary["sessions"]) == len(coverage)
+assert summary["counts"]["decision_signals"] == 2
+tracked = json.loads((root / "tracked-paths.json").read_text())
+assert ".project-context/model.yaml" not in tracked
+assert ".project-context/events.jsonl" not in tracked
 untracked = [json.loads(line) for line in (root / "untracked.jsonl").read_text().splitlines()]
 visible = next(item for item in untracked if item["path"] == "visible.txt")
 assert (root / visible["snapshot"]).read_text() == "untracked\n"
@@ -172,9 +187,30 @@ for name in ["commit-coverage.jsonl", "conversation-coverage.jsonl", "untracked-
         if record["status"] == "pending":
             record["status"] = "analyzed"
     (root / name).write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
+path = root / "decision-coverage.jsonl"
+records = [json.loads(line) for line in path.read_text().splitlines()]
+for record in records:
+    record["status"] = "decision"
+    record["topic"] = "local dependency boundary"
+    record["rationale"] = "Target repositories must not need build tools."
+    record["candidate"] = "candidate:local-dependency"
+path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
 PY
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
   verify-coverage --inventory "$inventory" >/dev/null
+candidate_events="${test_root}/candidate-events.jsonl"
+: > "$candidate_events"
+set +e
+HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+  verify-candidates --inventory "$inventory" --events "$candidate_events" >/dev/null 2>&1
+missing_candidate_status=$?
+set -e
+[ "$missing_candidate_status" -eq 2 ]
+printf '%s\n' \
+  '{"schema_version":1,"type":"decision","id":"candidate:local-dependency","date":"2026-07-19","subject":"local dependency boundary","decision":"Use local binaries.","reason":"Target repositories must not need build tools.","evidence":["conversation:codex:codex-related#1","conversation:claude:claude-related#0"]}' \
+  > "$candidate_events"
+HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+  verify-candidates --inventory "$inventory" --events "$candidate_events" >/dev/null
 cp "${inventory}/conversation-coverage.jsonl" "${inventory}/conversation-coverage.before"
 python3 - "$inventory" <<'PY'
 import json, pathlib, sys

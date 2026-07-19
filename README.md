@@ -149,6 +149,13 @@ status `3`, preserves existing intent and event bytes, and makes repeated
 semantic candidates a no-op. Canonical evidence records only provider, session
 ID, and record index, not transcript paths or transcript text.
 
+Reconstruction does not use current or historical Project Context model/event
+files as evidence. Those paths are omitted from Git and worktree inventories,
+materialized copies are redacted from non-user conversation records, and base
+snapshots remain opaque until the final preservation merge. A separate
+direct-user decision audit must also pass before apply, so ordinary source
+coverage cannot conceal missed accepted proposals or reason-qualified choices.
+
 Packages produced from this source contain exactly the two top-level skill
 directories. Installation accepts only fresh, additive-companion, or fully
 identical states. If either installed skill differs from the verified package,

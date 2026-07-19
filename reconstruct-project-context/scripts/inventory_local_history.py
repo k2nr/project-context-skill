@@ -18,6 +18,7 @@ MAX_METADATA_BYTES = 64 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024
 MAX_UNTRACKED_BYTES = 2 * 1024 * 1024
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
+CANDIDATE_ID_PATTERN = re.compile(r"candidate:[A-Za-z0-9][A-Za-z0-9._:-]{0,239}\Z")
 STRING_FIELD = rb'"%s"\s*:\s*("(?:\\.|[^"\\])*")'
 FORBIDDEN_METADATA_KEYS = [
     b'"message"',
@@ -27,6 +28,18 @@ FORBIDDEN_METADATA_KEYS = [
     b'"base_instructions"',
     b'"dynamic_tools"',
 ]
+CANONICAL_CONTEXT_PATHS = (
+    ".project-context/model.yaml",
+    ".project-context/events.jsonl",
+)
+SYNTHETIC_USER_PREFIXES = (
+    "<recommended_plugins>",
+    "<environment_context>",
+    "<skill>",
+    "# AGENTS.md instructions",
+    "The following is the Codex agent history",
+    "<codex_delegation>",
+)
 
 
 class InventoryError(RuntimeError):
@@ -44,6 +57,79 @@ def run_git(root: Path, *arguments: str, check: bool = True) -> str:
     if check and result.returncode != 0:
         raise InventoryError(result.stderr.strip() or "git command failed")
     return result.stdout
+
+
+def evidence_pathspecs() -> list[str]:
+    return [
+        ".",
+        ":(glob,exclude)**/.project-context/model.yaml",
+        ":(glob,exclude)**/.project-context/events.jsonl",
+    ]
+
+
+def tracked_paths(root: Path) -> list[str]:
+    return sorted(run_git(root, "ls-files", "--", *evidence_pathspecs()).splitlines())
+
+
+def worktree_patch(root: Path) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(root), "diff", "--binary", "HEAD", "--", *evidence_pathspecs()],
+        check=False,
+        stdout=subprocess.PIPE,
+    ).stdout
+
+
+def canonical_context_path(relative: str) -> bool:
+    normalized = relative.replace("\\", "/").lstrip("./")
+    return any(
+        normalized == path or normalized.endswith(f"/{path}")
+        for path in CANONICAL_CONTEXT_PATHS
+    )
+
+
+def text_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    return "\n".join(parts)
+
+
+def direct_user_message(provider: str, record: dict[str, Any]) -> str | None:
+    record_type = record.get("type")
+    payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+    text = ""
+    if provider == "codex":
+        if record_type == "response_item" and payload.get("type") == "message":
+            if payload.get("role") == "user":
+                text = text_content(payload.get("content"))
+        elif record_type == "message" and payload.get("role") == "user":
+            text = text_content(payload.get("content"))
+    elif provider == "claude" and record_type == "user":
+        message = record.get("message")
+        if isinstance(message, dict):
+            text = text_content(message.get("content"))
+    text = text.strip()
+    if not text or text.startswith(SYNTHETIC_USER_PREFIXES):
+        return None
+    return text
+
+
+def contains_canonical_context_artifact(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.replace("\\", "/")
+        return any(path in normalized for path in CANONICAL_CONTEXT_PATHS)
+    if isinstance(value, list):
+        return any(contains_canonical_context_artifact(item) for item in value)
+    if isinstance(value, dict):
+        return any(contains_canonical_context_artifact(item) for item in value.values())
+    return False
 
 
 def repository_identity(root: Path) -> tuple[Path, Path]:
@@ -290,13 +376,25 @@ def preflight(root: Path, include_git: bool, include_conversations: bool) -> dic
                         if line and not line.startswith("-")
                     ),
                     "tracked_worktree_changed_path_count": len(
-                        set(run_git(root, "diff", "--name-only", "HEAD", check=False).splitlines())
+                        set(
+                            run_git(
+                                root,
+                                "diff",
+                                "--name-only",
+                                "HEAD",
+                                "--",
+                                *evidence_pathspecs(),
+                                check=False,
+                            ).splitlines()
+                        )
                     ),
                     "non_ignored_untracked_path_count": len(
                         set(
-                            run_git(
+                            relative
+                            for relative in run_git(
                                 root, "ls-files", "--others", "--exclude-standard"
                             ).splitlines()
+                            if not canonical_context_path(relative)
                         )
                     ),
                 },
@@ -399,7 +497,17 @@ def collect_commits(
                 )
                 continue
             patch = subprocess.run(
-                ["git", "-C", str(repository), "show", "--format=", "--binary", commit],
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "show",
+                    "--format=",
+                    "--binary",
+                    commit,
+                    "--",
+                    *evidence_pathspecs(),
+                ],
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -434,9 +542,10 @@ def collect_commits(
 
 def collect_conversations(
     output: Path, sessions: list[dict[str, Any]]
-) -> tuple[int, int, list[dict[str, Any]]]:
+) -> tuple[int, int, int, list[dict[str, Any]]]:
     inventory: list[dict[str, Any]] = []
     coverage: list[dict[str, Any]] = []
+    decision_coverage: list[dict[str, Any]] = []
     session_reports: list[dict[str, Any]] = []
     for provider, session_id in sorted(
         {(item["provider"], item["session_id"]) for item in sessions}
@@ -480,8 +589,28 @@ def collect_conversations(
                             {"source": evidence, "status": "unavailable", "reason": "malformed JSONL record"}
                         )
                         continue
-                    inventory.append({"evidence": evidence, "record": value})
-                    coverage.append({"source": evidence, "status": "pending"})
+                    user_message = (
+                        direct_user_message(provider, value) if isinstance(value, dict) else None
+                    )
+                    if user_message is None and contains_canonical_context_artifact(value):
+                        inventory.append(
+                            {
+                                "evidence": evidence,
+                                "record": {"type": "canonical-context-artifact-redacted"},
+                            }
+                        )
+                        coverage.append(
+                            {
+                                "source": evidence,
+                                "status": "excluded",
+                                "reason": "Canonical model or event content is not reconstruction evidence.",
+                            }
+                        )
+                    else:
+                        inventory.append({"evidence": evidence, "record": value})
+                        coverage.append({"source": evidence, "status": "pending"})
+                    if user_message is not None:
+                        decision_coverage.append({"source": evidence, "status": "pending"})
             if (
                 os.environ.get("PROJECT_CONTEXT_INVENTORY_TESTING") == "1"
                 and os.environ.get("PROJECT_CONTEXT_INVENTORY_TEST_MUTATE_SESSION") == "1"
@@ -497,6 +626,7 @@ def collect_conversations(
     return (
         write_jsonl(output / "conversations.jsonl", inventory),
         write_jsonl(output / "conversation-coverage.jsonl", coverage),
+        write_jsonl(output / "decision-coverage.jsonl", decision_coverage),
         session_reports,
     )
 
@@ -564,23 +694,28 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     )
     repositories = selected_repositories(root, args) if args.include_git else []
     commit_count, commit_coverage_count = collect_commits(output, repositories)
-    conversation_count, conversation_coverage_count, session_reports = collect_conversations(
-        output, sessions
-    )
-    tracked = sorted(run_git(root, "ls-files").splitlines()) if args.include_git else []
+    (
+        conversation_count,
+        conversation_coverage_count,
+        decision_coverage_count,
+        session_reports,
+    ) = collect_conversations(output, sessions)
+    tracked = tracked_paths(root) if args.include_git else []
     (output / "tracked-paths.json").write_text(
         json.dumps(tracked, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     worktree = b""
     if args.include_worktree:
-        worktree = subprocess.run(
-            ["git", "-C", str(root), "diff", "--binary", "HEAD"],
-            check=False,
-            stdout=subprocess.PIPE,
-        ).stdout
+        worktree = worktree_patch(root)
         (output / "worktree.patch").write_bytes(worktree)
     untracked = (
-        sorted(run_git(root, "ls-files", "--others", "--exclude-standard").splitlines())
+        sorted(
+            relative
+            for relative in run_git(
+                root, "ls-files", "--others", "--exclude-standard"
+            ).splitlines()
+            if not canonical_context_path(relative)
+        )
         if args.include_untracked
         else []
     )
@@ -593,19 +728,19 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         current_repositories = selected_repositories(root, args)
         frozen = [(name, revisions) for name, _, revisions in repositories]
         current = [(name, revisions) for name, _, revisions in current_repositories]
-        if current != frozen or sorted(run_git(root, "ls-files").splitlines()) != tracked:
+        if current != frozen or tracked_paths(root) != tracked:
             raise InventoryError("Git sources changed during collection")
     if args.include_worktree:
-        current_worktree = subprocess.run(
-            ["git", "-C", str(root), "diff", "--binary", "HEAD"],
-            check=False,
-            stdout=subprocess.PIPE,
-        ).stdout
+        current_worktree = worktree_patch(root)
         if current_worktree != worktree:
             raise InventoryError("tracked worktree changed during collection")
     if args.include_untracked:
         current_untracked = sorted(
-            run_git(root, "ls-files", "--others", "--exclude-standard").splitlines()
+            relative
+            for relative in run_git(
+                root, "ls-files", "--others", "--exclude-standard"
+            ).splitlines()
+            if not canonical_context_path(relative)
         )
         if current_untracked != untracked:
             raise InventoryError("untracked source set changed during collection")
@@ -644,6 +779,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             "commit_coverage": commit_coverage_count,
             "conversation_records": conversation_coverage_count,
             "parseable_conversation_records": conversation_count,
+            "decision_signals": decision_coverage_count,
             "tracked_paths": len(tracked),
             "untracked_paths": len(untracked),
             "untracked_coverage": untracked_coverage_count,
@@ -656,7 +792,11 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    coverage_names = ["commit-coverage.jsonl", "conversation-coverage.jsonl"]
+    coverage_names = [
+        "commit-coverage.jsonl",
+        "conversation-coverage.jsonl",
+        "decision-coverage.jsonl",
+    ]
     if args.include_untracked:
         coverage_names.append("untracked-coverage.jsonl")
     source_manifest: dict[str, list[str]] = {}
@@ -698,7 +838,7 @@ def verify_coverage(inventory: Path) -> dict[str, Any]:
     manifest = json.loads((inventory / "coverage-sources.json").read_text(encoding="utf-8"))
     if manifest.get("version") != 1 or not isinstance(manifest.get("sources"), dict):
         raise InventoryError("coverage source manifest is invalid")
-    expected_names = {name for name, _ in specifications}
+    expected_names = {name for name, _ in specifications} | {"decision-coverage.jsonl"}
     if set(manifest["sources"]) != expected_names:
         raise InventoryError("coverage source manifest does not match selected inventories")
     totals = {"analyzed": 0, "excluded": 0, "unavailable": 0}
@@ -728,7 +868,98 @@ def verify_coverage(inventory: Path) -> dict[str, Any]:
         ):
             raise InventoryError(f"{name} sources do not match the frozen manifest")
     totals["total"] = sum(totals.values())
+    decision_records = load_jsonl(inventory / "decision-coverage.jsonl")
+    if len(decision_records) != summary["counts"]["decision_signals"]:
+        raise InventoryError("decision-coverage.jsonl count does not match frozen inventory")
+    decision_manifest = manifest["sources"]["decision-coverage.jsonl"]
+    decision_sources: set[str] = set()
+    decision_totals = {"decision": 0, "model": 0, "excluded": 0, "unavailable": 0}
+    for record in decision_records:
+        source = record.get("source")
+        status_value = record.get("status")
+        if not isinstance(source, str) or source in decision_sources:
+            raise InventoryError("decision-coverage.jsonl has a missing or duplicate source")
+        decision_sources.add(source)
+        if status_value not in decision_totals:
+            raise InventoryError(
+                f"decision-coverage.jsonl contains unresolved status {status_value!r}"
+            )
+        if status_value in {"decision", "model"} and not record.get("topic"):
+            raise InventoryError(f"decision-coverage.jsonl requires a topic for {status_value}")
+        if status_value == "decision" and not record.get("rationale"):
+            raise InventoryError("decision-coverage.jsonl requires rationale for decision")
+        if status_value == "decision" and not (
+            isinstance(record.get("candidate"), str)
+            and CANDIDATE_ID_PATTERN.fullmatch(record["candidate"])
+        ):
+            raise InventoryError("decision-coverage.jsonl requires a candidate ID for decision")
+        if status_value in {"excluded", "unavailable"} and not record.get("reason"):
+            raise InventoryError(f"decision-coverage.jsonl requires a reason for {status_value}")
+        decision_totals[status_value] += 1
+    if (
+        not isinstance(decision_manifest, list)
+        or len(decision_manifest) != len(decision_records)
+        or len(set(decision_manifest)) != len(decision_manifest)
+        or decision_sources != set(decision_manifest)
+    ):
+        raise InventoryError("decision-coverage.jsonl sources do not match the frozen manifest")
+    if not decision_sources <= set(manifest["sources"]["conversation-coverage.jsonl"]):
+        raise InventoryError("decision coverage contains a non-conversation source")
+    totals["decision_signals"] = decision_totals
     return totals
+
+
+def verify_candidates(inventory: Path, events: Path) -> dict[str, Any]:
+    coverage = verify_coverage(inventory)
+    decision_records = load_jsonl(inventory / "decision-coverage.jsonl")
+    statuses = {record["source"]: record["status"] for record in decision_records}
+    required_records = [record for record in decision_records if record["status"] == "decision"]
+    event_records = load_jsonl(events)
+    event_sources: set[str] = set()
+    events_by_id: dict[str, dict[str, Any]] = {}
+    decision_event_count = 0
+    for index, event in enumerate(event_records, 1):
+        if event.get("type") == "decision":
+            decision_event_count += 1
+        evidence = event.get("evidence", [])
+        if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
+            raise InventoryError(f"candidate event {index} has invalid evidence")
+        if event.get("type") == "decision" and not event.get("reason"):
+            raise InventoryError(f"candidate decision {index} has no reason")
+        event_sources.update(evidence)
+        event_id = event.get("id")
+        if isinstance(event_id, str):
+            if event_id in events_by_id:
+                raise InventoryError(f"duplicate candidate event ID {event_id}")
+            events_by_id[event_id] = event
+    for record in required_records:
+        source = record["source"]
+        candidate = record["candidate"]
+        event = events_by_id.get(candidate)
+        if event is None or event.get("type") != "decision":
+            raise InventoryError(f"decision signal {source} references missing {candidate}")
+        if source not in event.get("evidence", []):
+            raise InventoryError(f"decision signal {source} is absent from {candidate} evidence")
+        event_reason = " ".join(str(event.get("reason", "")).split())
+        audit_reason = " ".join(str(record["rationale"]).split())
+        if event_reason != audit_reason:
+            raise InventoryError(f"decision signal {source} rationale differs from {candidate}")
+    contradicted = sorted(
+        source
+        for source in event_sources
+        if source in statuses and statuses[source] != "decision"
+    )
+    if contradicted:
+        raise InventoryError(
+            "candidate event evidence contradicts decision coverage: "
+            + ", ".join(contradicted)
+        )
+    return {
+        "candidate_events": len(event_records),
+        "decision_events": decision_event_count,
+        "decision_signals_covered": len(required_records),
+        "coverage": coverage,
+    }
 
 
 def parser() -> argparse.ArgumentParser:
@@ -750,6 +981,9 @@ def parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--include-untracked", action="store_true")
     verify_parser = commands.add_parser("verify-coverage")
     verify_parser.add_argument("--inventory", type=Path, required=True)
+    candidate_parser = commands.add_parser("verify-candidates")
+    candidate_parser.add_argument("--inventory", type=Path, required=True)
+    candidate_parser.add_argument("--events", type=Path, required=True)
     return result
 
 
@@ -764,8 +998,10 @@ def main() -> int:
             report = preflight(args.root, include_git, include_conversations)
         elif args.command == "collect":
             report = collect(args)
-        else:
+        elif args.command == "verify-coverage":
             report = verify_coverage(args.inventory)
+        else:
+            report = verify_candidates(args.inventory, args.events)
     except (InventoryError, OSError, KeyError, json.JSONDecodeError) as error:
         print(f"inventory: {error}", file=sys.stderr)
         return 2
