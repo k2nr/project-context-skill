@@ -75,7 +75,9 @@ Never infer consent from invoking this skill. Skip the question only when the us
 7. Build the complete independent candidate set from approved evidence, without consulting the base
    model or base events. Follow the qualification rules exactly. Write the proposed integrated model
    only after candidate extraction is complete, using the opaque base solely as a preservation
-   boundary. Then require every `decision` signal to be represented in candidate event evidence:
+   boundary. Write candidate events from oldest to newest; within one date, preserve the order in
+   which their earliest qualifying evidence occurred. Then require every `decision` signal to be
+   represented in candidate event evidence:
 
    ```sh
    python3 .agents/skills/reconstruct-project-context/scripts/inventory_local_history.py \

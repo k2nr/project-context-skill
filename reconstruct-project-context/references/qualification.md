@@ -42,3 +42,10 @@ Create an attempt only for a non-obvious or costly experiment whose result is re
 ## Candidate IDs and references
 
 Temporary candidate IDs are local staging keys in the `candidate:` namespace, not durable IDs. They must never use a canonical `D-` or `A-` ID. Let `apply-reconstruction` deduplicate semantic content, reuse existing IDs, allocate stable D/A IDs, and resolve candidate references. Treat unresolved references, cycles, and divergent supersession as invalid data; do not work around them by deleting evidence.
+
+## Timeline order
+
+Write candidate events from the oldest date to the newest. For events on the same date, order them
+by the timestamp of their earliest qualifying source record; if the source has only sequence
+information, use that sequence. `apply-reconstruction` preserves this same-date order while merging
+all canonical events into date order.

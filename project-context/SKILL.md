@@ -44,6 +44,8 @@ approximate token. Increase it if the required packet cannot fit.
 7. Never rewrite a valid historical event. Append a decision with
    `--supersedes`, or append a new attempt under materially different
    conditions.
+8. Let the CLI keep event records in ascending date order. Records on the same date retain their
+   established order.
 
 Update discovered project identity or operation commands without rewriting
 other intent or history:

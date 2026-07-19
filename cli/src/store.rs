@@ -684,6 +684,7 @@ pub fn apply_reconstruction(
             }
         }
     }
+    candidates.sort_by_key(|event| event_date(event).to_owned());
 
     let mut existing_by_key = BTreeMap::new();
     for event in &current_data.events {
@@ -733,16 +734,8 @@ pub fn apply_reconstruction(
         }
     }
 
-    retained.sort_by_key(|event| {
-        (
-            event
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-            event_dedupe_key(event).unwrap_or_default(),
-        )
-    });
+    // Stable date ordering preserves the evidence-derived candidate order within a day.
+    retained.sort_by_key(|event| event_date(event).to_owned());
     let mut allocated_events = current_data.events.clone();
     for event in &mut retained {
         let Some(candidate_id) = event.get("id").and_then(Value::as_str).map(str::to_owned) else {
@@ -782,17 +775,8 @@ pub fn apply_reconstruction(
         StoreError::Environment(format!("cannot serialize proposed model: {error}"))
     })?;
 
-    let mut combined_events = documents.events.clone();
-    if !combined_events.is_empty() && !combined_events.ends_with('\n') && !retained.is_empty() {
-        combined_events.push('\n');
-    }
-    for event in &retained {
-        let serialized = serde_json::to_string(event).map_err(|error| {
-            StoreError::Environment(format!("cannot serialize proposed event: {error}"))
-        })?;
-        combined_events.push_str(&serialized);
-        combined_events.push('\n');
-    }
+    let combined_events =
+        merge_events_in_timeline_order(&documents.events, &current_data.events, &retained)?;
 
     let (mut proposed_report, _) = inspect_documents(
         &documents.model_schema,
@@ -808,7 +792,8 @@ pub fn apply_reconstruction(
     }
 
     let model_changed = proposed_model.as_bytes() != documents.model.as_bytes();
-    let no_op = !model_changed && retained.is_empty();
+    let events_changed = combined_events.as_bytes() != documents.events.as_bytes();
+    let no_op = !model_changed && !events_changed;
     if !no_op {
         transactional_replace(
             root,
@@ -834,6 +819,48 @@ fn valid_candidate_key(id: &str) -> bool {
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character))
     })
+}
+
+fn event_date(event: &Value) -> &str {
+    event.get("date").and_then(Value::as_str).unwrap_or("")
+}
+
+fn merge_events_in_timeline_order(
+    existing_text: &str,
+    existing_events: &[Value],
+    new_events: &[Value],
+) -> Result<String, StoreError> {
+    let already_ordered = existing_events
+        .windows(2)
+        .all(|events| event_date(&events[0]) <= event_date(&events[1]));
+    if new_events.is_empty() && already_ordered {
+        return Ok(existing_text.to_owned());
+    }
+
+    let existing_lines: Vec<&str> = existing_text.lines().collect();
+    if existing_lines.len() != existing_events.len() {
+        return Err(StoreError::Environment(
+            "cannot align canonical event lines with parsed events".to_owned(),
+        ));
+    }
+    let mut lines: Vec<(String, String)> = existing_events
+        .iter()
+        .zip(existing_lines)
+        .map(|(event, line)| (event_date(event).to_owned(), line.to_owned()))
+        .collect();
+    for event in new_events {
+        let line = serde_json::to_string(event)
+            .map_err(|error| StoreError::Environment(format!("cannot serialize event: {error}")))?;
+        lines.push((event_date(event).to_owned(), line));
+    }
+    // Rust's stable sort retains canonical or candidate order when only day precision exists.
+    lines.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(lines
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n")
 }
 
 fn resolve_reference_map(
@@ -1139,14 +1166,11 @@ where
     }
 
     let event = create(&data.events).map_err(StoreError::Environment)?;
-    let serialized = serde_json::to_string(&event)
-        .map_err(|error| StoreError::Environment(format!("cannot serialize event: {error}")))?;
-    let mut proposed_events = documents.events;
-    if !proposed_events.is_empty() && !proposed_events.ends_with('\n') {
-        proposed_events.push('\n');
-    }
-    proposed_events.push_str(&serialized);
-    proposed_events.push('\n');
+    let proposed_events = merge_events_in_timeline_order(
+        &documents.events,
+        &data.events,
+        std::slice::from_ref(&event),
+    )?;
 
     let (proposed_report, _) = inspect_documents(
         &documents.model_schema,
@@ -2344,6 +2368,10 @@ mod tests {
     #[test]
     fn add_attempt_supports_explicit_id_date_and_inconclusive_result() {
         let directory = initialized();
+        write(
+            &directory.path().join(".project-context/events.jsonl"),
+            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-06-27\",\"subject\":\"later\",\"decision\":\"later\",\"reason\":\"later\"}\n",
+        );
         let mut input = attempt("inconclusive");
         input.id = Some("A-42".to_owned());
         input.date = Some("2026-06-26".to_owned());
@@ -2351,6 +2379,18 @@ mod tests {
         let event = add_attempt(directory.path(), input).expect("append attempt");
         assert_eq!(event["id"], "A-42");
         assert_eq!(event["result"], "inconclusive");
+        let stored = fs::read_to_string(directory.path().join(".project-context/events.jsonl"))
+            .expect("read events");
+        let subjects: Vec<String> = stored
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("event JSON")["subject"]
+                    .as_str()
+                    .expect("subject")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(subjects, ["callback delivery", "later"]);
         assert!(validate(&directory).valid);
     }
 

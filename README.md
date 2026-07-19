@@ -118,7 +118,9 @@ After installation, the target repository contains:
 The installer creates `.project-context/` through `project-context init`. It
 uses `project-context configure` to update only explicitly supplied project and
 operation fields, then runs `project-context doctor --installation` and strict
-validation. Existing intent sections and event history are preserved.
+validation. Existing intent sections and event history are preserved. Event
+records are stored in ascending date order; events with the same date retain
+their established source order.
 
 The managed block instructs compatible coding agents to load Project Context
 for non-trivial work without explicit user invocation. Skill discovery remains

@@ -21,6 +21,8 @@ behaviors:
     statement: After the source-scope gate, reconstruction automatically applies only evidence-qualified, non-conflicting model additions and reusable decision or attempt events through a base-state checked transaction.
     related_events:
       - D-0002
+  - id: chronological-event-timeline
+    statement: Store canonical events in ascending date order while preserving established evidence order among events with the same date.
 constraints: []
 operations:
   build:

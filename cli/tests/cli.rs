@@ -256,6 +256,76 @@ fn reconstruction_applies_atomically_and_is_idempotent() {
 }
 
 #[test]
+fn reconstruction_writes_a_stable_event_timeline() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    let context = directory.path().join(".project-context");
+    fs::write(
+        context.join("events.jsonl"),
+        concat!(
+            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-20\",\"subject\":\"late existing\",\"decision\":\"late\",\"reason\":\"late\"}\n",
+            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-2\",\"date\":\"2026-07-18\",\"subject\":\"early existing\",\"decision\":\"early\",\"reason\":\"early\"}\n",
+        ),
+    )
+    .expect("write base events");
+    let base_model = directory.path().join("base-model.yaml");
+    let base_events = directory.path().join("base-events.jsonl");
+    let proposed_model = directory.path().join("proposed-model.yaml");
+    let proposed_events = directory.path().join("proposed-events.jsonl");
+    fs::copy(context.join("model.yaml"), &base_model).expect("copy base model");
+    fs::copy(context.join("events.jsonl"), &base_events).expect("copy base events");
+    fs::copy(&base_model, &proposed_model).expect("copy proposed model");
+    fs::write(
+        &proposed_events,
+        concat!(
+            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"candidate:middle-decision\",\"date\":\"2026-07-19\",\"subject\":\"middle decision\",\"decision\":\"middle\",\"reason\":\"middle\"}\n",
+            "{\"schema_version\":1,\"type\":\"attempt\",\"id\":\"candidate:middle-attempt\",\"date\":\"2026-07-19\",\"subject\":\"middle attempt\",\"approach\":\"try\",\"result\":\"failed\",\"finding\":\"finding\"}\n",
+        ),
+    )
+    .expect("write proposed events");
+
+    let output = cli(
+        directory.path(),
+        &[
+            "apply-reconstruction",
+            "--base-model",
+            base_model.to_str().expect("base model path"),
+            "--base-events",
+            base_events.to_str().expect("base events path"),
+            "--model",
+            proposed_model.to_str().expect("proposed model path"),
+            "--events",
+            proposed_events.to_str().expect("proposed events path"),
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{}", stdout(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("report JSON");
+    assert_eq!(report["events_added"], 2);
+    assert_eq!(report["no_op"], false);
+    let stored = fs::read_to_string(context.join("events.jsonl")).expect("read events");
+    let subjects: Vec<String> = stored
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).expect("event JSON")["subject"]
+                .as_str()
+                .expect("subject")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        subjects,
+        [
+            "early existing",
+            "middle decision",
+            "middle attempt",
+            "late existing"
+        ]
+    );
+}
+
+#[test]
 fn reconstruction_reports_base_conflicts_without_mutation() {
     let directory = TempDir::new().expect("temporary directory");
     assert!(cli(directory.path(), &["init"]).status.success());
