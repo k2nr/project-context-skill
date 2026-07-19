@@ -36,7 +36,7 @@ json_escape() {
   printf '%s' "$1" | awk '
     BEGIN { first=1 }
     {
-      gsub(/\\/, "\\\\"); gsub(/\"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r")
+      gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r")
       if (!first) printf "\\n"
       printf "%s", $0
       first=0
@@ -221,7 +221,7 @@ fi
 if command -v git >/dev/null 2>&1 \
   && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git_root=$(git rev-parse --show-toplevel) || fail "cannot resolve the Git repository root"
-  physical_git_root=$(CDPATH= cd -- "$git_root" && pwd -P) \
+  physical_git_root=$(CDPATH='' cd -- "$git_root" && pwd -P) \
     || fail "cannot resolve the physical Git repository root"
   [ "$(pwd -P)" = "$physical_git_root" ] || fail "run from the target repository root"
 fi
@@ -477,7 +477,7 @@ elif [ -e "$destination" ]; then
   find "$destination" ! -type d ! -type f -print -quit | grep -q . \
     && conflict "$destination contains an unsupported member type and was not overwritten"
   if trees_identical "$destination" "$package_root" skill-identity; then
-    skill_action=preserved-identical
+    skill_action='preserved-identical'
   else
     sed -n '1,80p' "${temporary_root}/skill-identity.diff" >&2
     conflict "$destination differs from v${PROJECT_CONTEXT_VERSION} and was not overwritten"
@@ -494,7 +494,7 @@ elif [ -e "$reconstruction_destination" ]; then
   if [ ! -e "$destination" ]; then
     conflict "unsupported partial installation: reconstruct-project-context exists without project-context"
   elif trees_identical "$reconstruction_destination" "$reconstruction_root" reconstruction-identity; then
-    reconstruction_action=preserved-identical
+    reconstruction_action='preserved-identical'
   else
     sed -n '1,80p' "${temporary_root}/reconstruction-identity.diff" >&2
     conflict "$reconstruction_destination differs from the verified package and was not overwritten"

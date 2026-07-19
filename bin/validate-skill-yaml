@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Validate Codex skill YAML contracts with PyYAML."""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+
+def construct_mapping(
+    loader: UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping
+)
+
+
+def load_mapping(text: str, label: str) -> dict[str, Any]:
+    try:
+        value = yaml.load(text, Loader=UniqueKeyLoader)
+    except yaml.YAMLError as error:
+        raise ValueError(f"{label} contains invalid YAML: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a YAML mapping")
+    return value
+
+
+def validate_skill(skill_directory: Path) -> None:
+    skill_file = skill_directory / "SKILL.md"
+    agents_file = skill_directory / "agents" / "openai.yaml"
+    if not skill_file.is_file():
+        raise ValueError("SKILL.md not found")
+    if not agents_file.is_file():
+        raise ValueError("agents/openai.yaml not found")
+
+    content = skill_file.read_text(encoding="utf-8")
+    match = re.match(r"^---\n(.*?)\n---(?:\n|$)", content, re.DOTALL)
+    if match is None:
+        raise ValueError("SKILL.md has invalid YAML frontmatter delimiters")
+    frontmatter = load_mapping(match.group(1), "SKILL.md frontmatter")
+    allowed = {"name", "description", "license", "allowed-tools", "metadata"}
+    unexpected = set(frontmatter) - allowed
+    if unexpected:
+        raise ValueError(f"unexpected frontmatter keys: {', '.join(sorted(unexpected))}")
+
+    name = frontmatter.get("name")
+    description = frontmatter.get("description")
+    if not isinstance(name, str) or not name:
+        raise ValueError("frontmatter name must be a non-empty string")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) or len(name) > 64:
+        raise ValueError("frontmatter name must be hyphen-case and at most 64 characters")
+    if name != skill_directory.name:
+        raise ValueError("frontmatter name must match the skill directory")
+    if not isinstance(description, str) or not description:
+        raise ValueError("frontmatter description must be a non-empty string")
+    if len(description) > 1024 or "<" in description or ">" in description:
+        raise ValueError("frontmatter description violates the skill contract")
+
+    agents = load_mapping(agents_file.read_text(encoding="utf-8"), "agents/openai.yaml")
+    interface = agents.get("interface")
+    if not isinstance(interface, dict):
+        raise ValueError("agents/openai.yaml interface must be a mapping")
+    for field in ("display_name", "short_description", "default_prompt"):
+        if not isinstance(interface.get(field), str) or not interface[field]:
+            raise ValueError(f"agents/openai.yaml interface.{field} must be a non-empty string")
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: validate-skill-yaml SKILL_DIRECTORY", file=sys.stderr)
+        return 2
+    try:
+        validate_skill(Path(sys.argv[1]))
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"validate-skill-yaml: {error}", file=sys.stderr)
+        return 1
+    print("skill YAML valid")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

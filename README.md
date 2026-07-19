@@ -171,6 +171,28 @@ musl-based systems, including Alpine Linux, and Windows are not supported. The
 launcher detects unsupported Linux libc implementations before downloading a
 binary. Cargo is not needed on target machines.
 
+## Development Environment
+
+Development dependencies are defined by `devbox.json` and locked by
+`devbox.lock`. With Devbox installed, enter the environment with:
+
+```sh
+devbox shell
+```
+
+Run the complete project verification with one command:
+
+```sh
+devbox run verify
+```
+
+The environment includes the Rust toolchain selected by `rust-toolchain.toml`,
+ShellCheck, Python 3.12, and PyYAML. The shared `bin/check` entry point provides
+the `build`, `format`, `lint`, `test`, and `verify` modes. Linting runs
+ShellCheck over the repository's shell files and validates both skills with the
+strict repository validator and the PyYAML-based skill-contract validator. The
+release workflow invokes the same complete verification entry point.
+
 ## Release Requirements
 
 Before publishing a release:

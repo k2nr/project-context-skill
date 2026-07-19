@@ -45,6 +45,14 @@ validate_json() {
   python3 -c 'import json, sys; json.load(sys.stdin)' >/dev/null
 }
 
+path_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
 mkdir "${test_root}/temporary"
 dry_run_repository="${test_root}/dry-run"
 mkdir "$dry_run_repository"
@@ -224,8 +232,9 @@ chmod_conflict_repository="${test_root}/rollback-chmod-conflict"
 mkdir "$chmod_conflict_repository"
 git -C "$chmod_conflict_repository" init -q
 set +e
-PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT=chmod \
-  run_installer "$chmod_conflict_repository" \
+PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT='chmod'
+export PROJECT_CONTEXT_INSTALL_INJECT_ROLLBACK_CONFLICT
+run_installer "$chmod_conflict_repository" \
     --format json \
     --project-id rollback-chmod-conflict \
     --description 'Rollback chmod conflict fixture.' \
@@ -264,7 +273,7 @@ cp -R "${target_repository}/.agents" "$mode_repository/.agents"
 cp -R "${target_repository}/.project-context" "$mode_repository/.project-context"
 cp "${target_repository}/AGENTS.md" "$mode_repository/AGENTS.md"
 mode_target="${mode_repository}/.agents/skills/reconstruct-project-context/SKILL.md"
-if [ "$(stat -f '%Lp' "$mode_target" 2>/dev/null || stat -c '%a' "$mode_target")" = 600 ]; then
+if [ "$(path_mode "$mode_target")" = 600 ]; then
   chmod 644 "$mode_target"
 else
   chmod 600 "$mode_target"

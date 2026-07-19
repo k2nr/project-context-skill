@@ -12,7 +12,7 @@ trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 fixture="${test_root}/collision/a-b/c"
 home="${test_root}/home"
 mkdir -p "$fixture" "$home/.codex/sessions" "$home/.codex/archived_sessions" "$home/.claude/projects"
-fixture=$(CDPATH= cd -- "$fixture" && pwd -P)
+fixture=$(CDPATH='' cd -- "$fixture" && pwd -P)
 git -C "$fixture" init -q -b master
 git -C "$fixture" config user.name Fixture
 git -C "$fixture" config user.email fixture@example.invalid
@@ -85,7 +85,7 @@ printf '%s\n' \
 collision_a="$fixture"
 collision_b="${test_root}/collision/a/b-c"
 mkdir -p "$collision_b"
-collision_b=$(CDPATH= cd -- "$collision_b" && pwd -P)
+collision_b=$(CDPATH='' cd -- "$collision_b" && pwd -P)
 git -C "$collision_b" init -q
 collision_encoded=$(printf '%s' "$collision_a" | tr / -)
 [ "$collision_encoded" = "$(printf '%s' "$collision_b" | tr / -)" ]

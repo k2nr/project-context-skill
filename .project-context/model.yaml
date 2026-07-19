@@ -24,18 +24,11 @@ behaviors:
 constraints: []
 operations:
   build:
-    - cargo build --locked --manifest-path cli/Cargo.toml
+    - devbox run build
   test:
-    - cargo test --locked --manifest-path cli/Cargo.toml
-    - tests/test-bootstrap.sh project-context/bin/project-context
-    - tests/test-skill-validator.sh
-    - tests/test-package.sh
-    - tests/test-installer-package.sh
-    - tests/test-installer.sh
-    - tests/test-reconstruction.sh
+    - devbox run test
   lint:
-    - cargo clippy --locked --manifest-path cli/Cargo.toml --all-targets -- -D warnings
-    - shellcheck project-context/bin/project-context bin/* tests/*.sh
+    - devbox run lint
   format:
-    - cargo fmt --manifest-path cli/Cargo.toml -- --check
+    - devbox run format
 extensions: {}
