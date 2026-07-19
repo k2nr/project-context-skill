@@ -137,8 +137,12 @@ The installer creates `.project-context/` through `project-context init`. It
 uses `project-context configure` to update only explicitly supplied project and
 operation fields, then runs `project-context doctor --installation` and strict
 validation. Existing intent sections and event history are preserved. Event
-records are stored in ascending date order; events with the same date retain
-their established source order.
+records are stored in timeline order, using exact `occurred_at` timestamps when
+available; events with only the same date retain their established source order.
+New stores use schema v2 with structured evidence, typed event relationships,
+evidence-backed model entries, and extensible structured operations. Existing
+schema v1 stores remain readable and can be upgraded atomically with
+`project-context migrate`.
 
 The managed block instructs compatible coding agents to load Project Context
 for non-trivial work without explicit user invocation. Skill discovery remains

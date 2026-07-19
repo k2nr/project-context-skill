@@ -10,7 +10,8 @@ authorized from-scratch reconstruction, initialize an empty canonical store befo
 - Fill a missing description or empty operation category only with direct evidence.
 - Append only new, non-conflicting model entries with stable, descriptive IDs.
 - Do not resolve contradictions by rewriting the base. Preserve and report them.
-- Link model entries only to event candidates that survive deduplication.
+- Link model entries only to event candidates that survive deduplication. Use typed
+  `event_relations` and attach structured evidence directly when it supports the current statement.
 
 ## Candidate completeness
 
@@ -37,15 +38,17 @@ Create an attempt only for a non-obvious or costly experiment whose result is re
 - Conversation evidence uses `conversation:<provider>:<session-id>#<record-index>` only.
 - Paraphrase the durable conclusion. Never copy transcript passages.
 - Omit credentials, tokens, personal data, generated logs, and secret-shaped values.
-- Do not invent reasons, causal claims, dates, or supersession links.
+- Record evidence as objects with `ref`; add `role` and `observed_at` only when explicit.
+- Do not invent reasons, causal claims, dates, timestamps, or event relations.
 
 ## Candidate IDs and references
 
-Temporary candidate IDs are local staging keys in the `candidate:` namespace, not durable IDs. They must never use a canonical `D-` or `A-` ID. Let `apply-reconstruction` deduplicate semantic content, reuse existing IDs, allocate stable D/A IDs, and resolve candidate references. Treat unresolved references, cycles, and divergent supersession as invalid data; do not work around them by deleting evidence.
+Temporary candidate IDs are local staging keys in the `candidate:` namespace, not durable IDs. They must never use a canonical `D-` or `A-` ID. Let `apply-reconstruction` deduplicate semantic content, reuse existing IDs, allocate stable D/A IDs, and resolve candidate references. Treat unresolved references, cycles, and divergent relations as invalid data; do not work around them by deleting evidence. Use `supersedes` only when the earlier decision is wholly obsolete. Use `partially_supersedes` with a concise `scope` when part remains valid, and use other typed relation kinds for provenance without claiming replacement.
 
 ## Timeline order
 
-Write candidate events from the oldest date to the newest. For events on the same date, order them
-by the timestamp of their earliest qualifying source record; if the source has only sequence
-information, use that sequence. `apply-reconstruction` preserves this same-date order while merging
-all canonical events into date order.
+Write candidate events from the oldest point in time to the newest. Populate `occurred_at` only from
+an explicit RFC 3339 source timestamp. For events without exact time, order same-date records by the
+timestamp of their earliest qualifying source record or, when only sequence is available, by that
+sequence. `apply-reconstruction` uses `occurred_at` when present and otherwise preserves this
+same-date order.

@@ -139,6 +139,15 @@ fn model_matches(
                     .flatten()
                     .filter_map(Value::as_str)
                     .map(str::to_owned)
+                    .chain(
+                        entry
+                            .get("event_relations")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|relation| relation.get("event").and_then(Value::as_str))
+                            .map(str::to_owned),
+                    )
                     .collect();
                 let mut score = relevance(entry, queries);
                 if !references.is_disjoint(matched_event_ids) {
@@ -203,6 +212,33 @@ fn expand_decision_components(
                     .or_default()
                     .insert(id.clone());
                 superseded.insert(target.to_owned());
+            }
+        }
+        for relation in event
+            .get("relations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let kind = relation.get("kind").and_then(Value::as_str);
+            if !matches!(kind, Some("supersedes" | "partially_supersedes")) {
+                continue;
+            }
+            let Some(target) = relation.get("event").and_then(Value::as_str) else {
+                continue;
+            };
+            if events.contains_key(target) {
+                graph
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(target.to_owned());
+                graph
+                    .entry(target.to_owned())
+                    .or_default()
+                    .insert(id.clone());
+                if kind == Some("supersedes") {
+                    superseded.insert(target.to_owned());
+                }
             }
         }
     }

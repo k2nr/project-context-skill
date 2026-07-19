@@ -76,7 +76,11 @@ Never infer consent from invoking this skill. Skip the question only when the us
    model or base events. Follow the qualification rules exactly. Write the proposed integrated model
    only after candidate extraction is complete, using the opaque base solely as a preservation
    boundary. Write candidate events from oldest to newest; within one date, preserve the order in
-   which their earliest qualifying evidence occurred. Then require every `decision` signal to be
+   which their earliest qualifying evidence occurred. Set `occurred_at` to that RFC 3339 timestamp
+   when it is explicit; do not infer a time from sequence alone. Emit schema v2 structured evidence
+   with `ref`, and add `role` or `observed_at` only when the source supports them. Use typed
+   relations, including scoped `partially_supersedes`, instead of flattening every historical change
+   into full supersession. Then require every `decision` signal to be
    represented in candidate event evidence:
 
    ```sh

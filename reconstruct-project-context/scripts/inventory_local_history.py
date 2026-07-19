@@ -917,28 +917,43 @@ def verify_candidates(inventory: Path, events: Path) -> dict[str, Any]:
     event_records = load_jsonl(events)
     event_sources: set[str] = set()
     events_by_id: dict[str, dict[str, Any]] = {}
+    evidence_by_id: dict[str, list[str]] = {}
     decision_event_count = 0
+
+    def evidence_refs(value: Any, index: int) -> list[str]:
+        if not isinstance(value, list):
+            raise InventoryError(f"candidate event {index} has invalid evidence")
+        refs: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                refs.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("ref"), str):
+                refs.append(item["ref"])
+            else:
+                raise InventoryError(f"candidate event {index} has invalid evidence")
+        return refs
+
     for index, event in enumerate(event_records, 1):
         if event.get("type") == "decision":
             decision_event_count += 1
         evidence = event.get("evidence", [])
-        if not isinstance(evidence, list) or any(not isinstance(item, str) for item in evidence):
-            raise InventoryError(f"candidate event {index} has invalid evidence")
+        refs = evidence_refs(evidence, index)
         if event.get("type") == "decision" and not event.get("reason"):
             raise InventoryError(f"candidate decision {index} has no reason")
-        event_sources.update(evidence)
+        event_sources.update(refs)
         event_id = event.get("id")
         if isinstance(event_id, str):
             if event_id in events_by_id:
                 raise InventoryError(f"duplicate candidate event ID {event_id}")
             events_by_id[event_id] = event
+            evidence_by_id[event_id] = refs
     for record in required_records:
         source = record["source"]
         candidate = record["candidate"]
         event = events_by_id.get(candidate)
         if event is None or event.get("type") != "decision":
             raise InventoryError(f"decision signal {source} references missing {candidate}")
-        if source not in event.get("evidence", []):
+        if source not in evidence_by_id.get(candidate, []):
             raise InventoryError(f"decision signal {source} is absent from {candidate} evidence")
         event_reason = " ".join(str(event.get("reason", "")).split())
         audit_reason = " ".join(str(record["rationale"]).split())

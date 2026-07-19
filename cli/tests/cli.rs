@@ -124,6 +124,140 @@ fn all_phase_four_commands_work_end_to_end() {
 }
 
 #[test]
+fn migration_upgrades_v1_provenance_and_enables_custom_operations() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    let context = directory.path().join(".project-context");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    fs::copy(
+        manifest.join("src/schemas/model-v1.json"),
+        context.join("schemas/model.schema.json"),
+    )
+    .expect("copy v1 model schema");
+    fs::copy(
+        manifest.join("src/schemas/event-v1.json"),
+        context.join("schemas/event.schema.json"),
+    )
+    .expect("copy v1 event schema");
+    fs::write(
+        context.join("model.yaml"),
+        concat!(
+            "schema_version: 1\n",
+            "project:\n  id: legacy\n",
+            "principles:\n",
+            "  - id: durable\n    statement: Preserve rationale.\n    related_events: [D-1]\n",
+            "architecture: []\nbehaviors: []\nconstraints: []\n",
+            "operations:\n  build: [cargo build]\n  test: []\n  lint: []\n  format: []\n",
+            "extensions: {}\n"
+        ),
+    )
+    .expect("write v1 model");
+    fs::write(
+        context.join("events.jsonl"),
+        "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-18\",\"subject\":\"legacy\",\"decision\":\"Preserve it.\",\"reason\":\"It matters.\",\"evidence\":[\"file:README.md\"],\"supersedes\":[]}\n",
+    )
+    .expect("write v1 event");
+
+    assert!(cli(directory.path(), &["validate"]).status.success());
+    let migrated = cli(directory.path(), &["migrate", "--format", "json"]);
+    assert!(migrated.status.success(), "{}", stdout(&migrated));
+    let report: Value = serde_json::from_slice(&migrated.stdout).expect("migration JSON");
+    assert_eq!(report["model_migrated"], true);
+    assert_eq!(report["events_migrated"], 1);
+    let model: Value = serde_yaml_ng::from_str(
+        &fs::read_to_string(context.join("model.yaml")).expect("migrated model"),
+    )
+    .expect("model YAML");
+    assert_eq!(model["schema_version"], 2);
+    assert_eq!(model["operations"]["build"][0]["command"], "cargo build");
+    assert_eq!(
+        model["principles"][0]["event_relations"][0],
+        serde_json::json!({"event":"D-1","kind":"related"})
+    );
+    let event: Value = serde_json::from_str(
+        fs::read_to_string(context.join("events.jsonl"))
+            .expect("migrated events")
+            .trim(),
+    )
+    .expect("event JSON");
+    assert_eq!(
+        event["evidence"][0],
+        serde_json::json!({"ref":"file:README.md"})
+    );
+
+    let configured = cli(
+        directory.path(),
+        &["configure", "--operation", "deploy=cargo run -- deploy"],
+    );
+    assert!(configured.status.success(), "{}", stdout(&configured));
+    assert!(
+        cli(directory.path(), &["validate", "--strict"])
+            .status
+            .success()
+    );
+    let second = cli(directory.path(), &["migrate", "--format", "json"]);
+    let second: Value = serde_json::from_slice(&second.stdout).expect("second migration JSON");
+    assert_eq!(second["no_op"], true);
+}
+
+#[test]
+fn typed_partial_supersession_requires_scope_and_preserves_the_store_atomically() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    assert!(
+        cli(
+            directory.path(),
+            &[
+                "add-decision",
+                "--id",
+                "D-1",
+                "--subject",
+                "baseline",
+                "--decision",
+                "Use the baseline.",
+                "--reason",
+                "It covers the default case."
+            ]
+        )
+        .status
+        .success()
+    );
+    let events = directory.path().join(".project-context/events.jsonl");
+    let before = fs::read(&events).expect("events before invalid relation");
+    let invalid = cli(
+        directory.path(),
+        &[
+            "add-decision",
+            "--subject",
+            "scoped revision",
+            "--decision",
+            "Use a revision in one scope.",
+            "--reason",
+            "The scope differs.",
+            "--relation",
+            "{\"event\":\"D-1\",\"kind\":\"partially_supersedes\"}",
+        ],
+    );
+    assert_eq!(invalid.status.code(), Some(1));
+    assert_eq!(fs::read(&events).expect("events after rejection"), before);
+    let valid = cli(
+        directory.path(),
+        &[
+            "add-decision",
+            "--subject",
+            "scoped revision",
+            "--decision",
+            "Use a revision in one scope.",
+            "--reason",
+            "The scope differs.",
+            "--relation",
+            "{\"event\":\"D-1\",\"kind\":\"partially_supersedes\",\"scope\":\"remote execution only\"}",
+        ],
+    );
+    assert!(valid.status.success(), "{}", stdout(&valid));
+}
+
+#[test]
 fn configure_updates_only_explicit_model_fields_and_preserves_history() {
     let directory = TempDir::new().expect("temporary directory");
     assert!(cli(directory.path(), &["init"]).status.success());
@@ -203,19 +337,23 @@ fn reconstruction_applies_atomically_and_is_idempotent() {
                 "architecture:\n",
                 "  - id: reconstructed-history\n",
                 "    statement: Preserve reconstructed repository intent.\n",
-                "    related_events:\n",
-                "      - candidate:decision"
+                "    evidence:\n",
+                "      - ref: file:src/history.rs\n",
+                "        role: implementation\n",
+                "    event_relations:\n",
+                "      - event: candidate:decision\n",
+                "        kind: origin"
             ),
         );
     fs::write(&proposed_model, model).expect("write proposed model");
     fs::write(
         &proposed_events,
         concat!(
-            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"candidate:decision\",",
+            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"candidate:decision\",",
             "\"date\":\"2026-07-19\",\"subject\":\"history reconstruction\",",
             "\"decision\":\"Preserve repository-linked local history.\",",
             "\"reason\":\"It contains durable project intent.\",",
-            "\"evidence\":[\"conversation:codex:fixture#4\"]}\n"
+            "\"evidence\":[{\"ref\":\"conversation:codex:fixture#4\",\"role\":\"choice\"}]}\n"
         ),
     )
     .expect("write proposed events");
@@ -263,8 +401,8 @@ fn reconstruction_writes_a_stable_event_timeline() {
     fs::write(
         context.join("events.jsonl"),
         concat!(
-            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-20\",\"subject\":\"late existing\",\"decision\":\"late\",\"reason\":\"late\"}\n",
-            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-2\",\"date\":\"2026-07-18\",\"subject\":\"early existing\",\"decision\":\"early\",\"reason\":\"early\"}\n",
+            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-20\",\"subject\":\"late existing\",\"decision\":\"late\",\"reason\":\"late\"}\n",
+            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-2\",\"date\":\"2026-07-18\",\"subject\":\"early existing\",\"decision\":\"early\",\"reason\":\"early\"}\n",
         ),
     )
     .expect("write base events");
@@ -278,8 +416,8 @@ fn reconstruction_writes_a_stable_event_timeline() {
     fs::write(
         &proposed_events,
         concat!(
-            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"candidate:middle-decision\",\"date\":\"2026-07-19\",\"subject\":\"middle decision\",\"decision\":\"middle\",\"reason\":\"middle\"}\n",
-            "{\"schema_version\":1,\"type\":\"attempt\",\"id\":\"candidate:middle-attempt\",\"date\":\"2026-07-19\",\"subject\":\"middle attempt\",\"approach\":\"try\",\"result\":\"failed\",\"finding\":\"finding\"}\n",
+            "{\"schema_version\":2,\"type\":\"attempt\",\"id\":\"candidate:middle-attempt\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T10:00:00Z\",\"subject\":\"middle attempt\",\"approach\":\"try\",\"result\":\"failed\",\"finding\":\"finding\"}\n",
+            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"candidate:middle-decision\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T09:00:00Z\",\"subject\":\"middle decision\",\"decision\":\"middle\",\"reason\":\"middle\"}\n",
         ),
     )
     .expect("write proposed events");
@@ -595,6 +733,10 @@ fn decision_flags_are_persisted_and_invalid_supersession_is_atomic() {
             "While the frontend owns the session.",
             "--evidence",
             "file:src/session.rs",
+            "--occurred-at",
+            "2026-07-17T10:30:00+09:00",
+            "--evidence-detail",
+            "{\"ref\":\"conversation:codex:fixture#9\",\"role\":\"rationale\",\"observed_at\":\"2026-07-17T10:29:00+09:00\"}",
             "--format",
             "json",
         ],
@@ -602,7 +744,11 @@ fn decision_flags_are_persisted_and_invalid_supersession_is_atomic() {
     assert!(second.status.success(), "{}", stdout(&second));
     let event: Value = serde_json::from_slice(&second.stdout).expect("decision JSON");
     assert_eq!(event["id"], "D-42");
-    assert_eq!(event["supersedes"], serde_json::json!(["D-41"]));
+    assert_eq!(event["occurred_at"], "2026-07-17T10:30:00+09:00");
+    assert_eq!(
+        event["relations"],
+        serde_json::json!([{"event":"D-41","kind":"supersedes"}])
+    );
     assert_eq!(
         event["rejected"],
         serde_json::json!(["Keep the old boundary.", "Duplicate ownership."])
@@ -610,7 +756,10 @@ fn decision_flags_are_persisted_and_invalid_supersession_is_atomic() {
     assert_eq!(event["conditions"], "While the frontend owns the session.");
     assert_eq!(
         event["evidence"],
-        serde_json::json!(["file:src/session.rs"])
+        serde_json::json!([
+            {"ref":"file:src/session.rs"},
+            {"ref":"conversation:codex:fixture#9","role":"rationale","observed_at":"2026-07-17T10:29:00+09:00"}
+        ])
     );
 
     let path = directory.path().join(".project-context/events.jsonl");

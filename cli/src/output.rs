@@ -1,6 +1,8 @@
 use crate::context::ContextPacket;
 use crate::doctor::DoctorReport;
-use crate::store::{ConfigureReport, InitReport, ReconstructionReport, ValidationReport};
+use crate::store::{
+    ConfigureReport, InitReport, MigrateReport, ReconstructionReport, ValidationReport,
+};
 use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::Value;
@@ -28,6 +30,19 @@ pub fn render_configure(report: &ConfigureReport, format: OutputFormat) -> Strin
                 format!("configured\n{}", report.updated.join("\n"))
             }
         }
+        _ => render_serializable(report, format),
+    }
+}
+
+pub fn render_migrate(report: &MigrateReport, format: OutputFormat) -> String {
+    match format {
+        OutputFormat::Text => format!(
+            "migration {}\nmodel migrated: {}\nevents migrated: {}\nschemas updated: {}",
+            if report.no_op { "unchanged" } else { "applied" },
+            report.model_migrated,
+            report.events_migrated,
+            report.schemas_updated
+        ),
         _ => render_serializable(report, format),
     }
 }

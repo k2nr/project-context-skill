@@ -6,8 +6,10 @@ mod store;
 use clap::{Parser, Subcommand, ValueEnum};
 use output::{
     OutputFormat, render_configure, render_conflict, render_context, render_doctor, render_event,
-    render_init, render_reconstruction, render_validation,
+    render_init, render_migrate, render_reconstruction, render_validation,
 };
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -45,6 +47,9 @@ enum Command {
         lint: Vec<String>,
         #[arg(long)]
         format_command: Vec<String>,
+        /// Set an extensible operation as NAME=COMMAND. Repeat for multiple steps.
+        #[arg(long)]
+        operation: Vec<String>,
     },
     /// Return relevant durable context for paths, symbols, phrases, or topics.
     Context {
@@ -68,6 +73,8 @@ enum Command {
         #[arg(long)]
         date: Option<String>,
         #[arg(long)]
+        occurred_at: Option<String>,
+        #[arg(long)]
         rejected: Vec<String>,
         #[arg(long)]
         supersedes: Vec<String>,
@@ -75,6 +82,12 @@ enum Command {
         conditions: Option<String>,
         #[arg(long)]
         evidence: Vec<String>,
+        /// Add structured evidence as a JSON object.
+        #[arg(long)]
+        evidence_detail: Vec<String>,
+        /// Add a typed event relation as a JSON object.
+        #[arg(long)]
+        relation: Vec<String>,
     },
     /// Append a costly or non-obvious experimental result.
     AddAttempt {
@@ -91,10 +104,18 @@ enum Command {
         #[arg(long)]
         date: Option<String>,
         #[arg(long)]
+        occurred_at: Option<String>,
+        #[arg(long)]
         conditions: Option<String>,
         #[arg(long)]
         evidence: Vec<String>,
+        #[arg(long)]
+        evidence_detail: Vec<String>,
+        #[arg(long)]
+        relation: Vec<String>,
     },
+    /// Atomically migrate a legacy v1 store to schema v2.
+    Migrate,
     /// Atomically apply a validated reconstruction of model and event history.
     ApplyReconstruction {
         #[arg(long)]
@@ -118,28 +139,9 @@ enum Command {
         #[arg(long)]
         installation: bool,
         /// Acknowledge an operation category that intentionally has no commands.
-        #[arg(long, value_enum)]
-        allow_empty: Vec<OperationKind>,
+        #[arg(long)]
+        allow_empty: Vec<String>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
-enum OperationKind {
-    Build,
-    Test,
-    Lint,
-    Format,
-}
-
-impl OperationKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Build => "build",
-            Self::Test => "test",
-            Self::Lint => "lint",
-            Self::Format => "format",
-        }
-    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -206,6 +208,7 @@ fn run(cli: &Cli) -> Result<String, AppError> {
             test,
             lint,
             format_command,
+            operation,
         } => {
             validate_optional_value("--project-id", project_id.as_deref())?;
             validate_optional_value("--description", description.as_deref())?;
@@ -213,6 +216,7 @@ fn run(cli: &Cli) -> Result<String, AppError> {
             validate_commands("--test", test)?;
             validate_commands("--lint", lint)?;
             validate_commands("--format-command", format_command)?;
+            let operations = parse_operations(operation)?;
             let root = nearest_root()?;
             let report = store::configure(
                 &root,
@@ -223,6 +227,7 @@ fn run(cli: &Cli) -> Result<String, AppError> {
                     test: test.clone(),
                     lint: lint.clone(),
                     format: format_command.clone(),
+                    operations,
                 },
             )?;
             Ok(render_configure(&report, cli.format))
@@ -263,10 +268,13 @@ fn run(cli: &Cli) -> Result<String, AppError> {
             reason,
             id,
             date,
+            occurred_at,
             rejected,
             supersedes,
             conditions,
             evidence,
+            evidence_detail,
+            relation,
         } => {
             let root = nearest_root()?;
             let event = store::add_decision(
@@ -277,10 +285,13 @@ fn run(cli: &Cli) -> Result<String, AppError> {
                     reason: reason.clone(),
                     id: id.clone(),
                     date: date.clone(),
+                    occurred_at: occurred_at.clone(),
                     rejected: rejected.clone(),
                     supersedes: supersedes.clone(),
                     conditions: conditions.clone(),
                     evidence: evidence.clone(),
+                    evidence_details: parse_json_objects("--evidence-detail", evidence_detail)?,
+                    relations: parse_json_objects("--relation", relation)?,
                 },
             )?;
             Ok(render_event(&event, cli.format))
@@ -292,8 +303,11 @@ fn run(cli: &Cli) -> Result<String, AppError> {
             finding,
             id,
             date,
+            occurred_at,
             conditions,
             evidence,
+            evidence_detail,
+            relation,
         } => {
             let root = nearest_root()?;
             let event = store::add_attempt(
@@ -305,11 +319,19 @@ fn run(cli: &Cli) -> Result<String, AppError> {
                     finding: finding.clone(),
                     id: id.clone(),
                     date: date.clone(),
+                    occurred_at: occurred_at.clone(),
                     conditions: conditions.clone(),
                     evidence: evidence.clone(),
+                    evidence_details: parse_json_objects("--evidence-detail", evidence_detail)?,
+                    relations: parse_json_objects("--relation", relation)?,
                 },
             )?;
             Ok(render_event(&event, cli.format))
+        }
+        Command::Migrate => {
+            let root = nearest_root()?;
+            let report = store::migrate(&root)?;
+            Ok(render_migrate(&report, cli.format))
         }
         Command::ApplyReconstruction {
             base_model,
@@ -357,10 +379,10 @@ fn run(cli: &Cli) -> Result<String, AppError> {
                 ));
             }
             let root = nearest_root()?;
-            let allowed = allow_empty
-                .iter()
-                .map(|operation| operation.as_str())
-                .collect();
+            for operation in allow_empty {
+                validate_operation_name(operation)?;
+            }
+            let allowed = allow_empty.iter().map(String::as_str).collect();
             let report =
                 doctor::inspect_installation(&root, &allowed).map_err(AppError::Environment)?;
             if report.ready {
@@ -370,6 +392,57 @@ fn run(cli: &Cli) -> Result<String, AppError> {
             }
         }
     }
+}
+
+fn parse_operations(values: &[String]) -> Result<BTreeMap<String, Vec<String>>, AppError> {
+    let mut operations = BTreeMap::new();
+    for value in values {
+        let (name, command) = value
+            .split_once('=')
+            .ok_or_else(|| AppError::Environment("--operation must use NAME=COMMAND".to_owned()))?;
+        validate_operation_name(name)?;
+        if command.trim().is_empty() {
+            return Err(AppError::Environment(
+                "--operation command must not be empty".to_owned(),
+            ));
+        }
+        operations
+            .entry(name.to_owned())
+            .or_insert_with(Vec::new)
+            .push(command.to_owned());
+    }
+    Ok(operations)
+}
+
+fn validate_operation_name(name: &str) -> Result<(), AppError> {
+    let valid = !name.is_empty()
+        && name.as_bytes()[0].is_ascii_lowercase()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(&byte)
+        });
+    if !valid {
+        return Err(AppError::Environment(format!(
+            "operation name '{name}' must match ^[a-z][a-z0-9._-]*$"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_json_objects(label: &str, values: &[String]) -> Result<Vec<Value>, AppError> {
+    values
+        .iter()
+        .map(|raw| {
+            let value: Value = serde_json::from_str(raw).map_err(|error| {
+                AppError::Environment(format!("{label} must be valid JSON: {error}"))
+            })?;
+            if !value.is_object() {
+                return Err(AppError::Environment(format!(
+                    "{label} must be a JSON object"
+                )));
+            }
+            Ok(value)
+        })
+        .collect()
 }
 
 fn validate_optional_value(label: &str, value: Option<&str>) -> Result<(), AppError> {

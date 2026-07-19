@@ -58,11 +58,11 @@ overwriting them and report the conflict.
 5. Record an attempt only when forgetting the result would likely repeat
    meaningful work or a costly dead end.
 6. Never record routine failures, trivial fixes, speculation, or transcripts.
-7. Never rewrite a valid historical event. Append a decision with
-   `--supersedes`, or append a new attempt under materially different
-   conditions.
-8. Let the CLI keep event records in ascending date order. Records on the same date retain their
-   established order.
+7. Never rewrite a valid historical event. Append a typed relation; `--supersedes` is the shorthand
+   for full replacement, while `--relation '{"event":"D-1","kind":"partially_supersedes","scope":"..."}'`
+   preserves decisions that remain valid outside the stated scope.
+8. Let the CLI keep event records in timeline order. Use `--occurred-at` when evidence provides an
+   exact RFC 3339 timestamp; otherwise same-date records retain their established order.
 
 Update discovered project identity or operation commands without rewriting
 other intent or history:
@@ -77,7 +77,9 @@ other intent or history:
   --format-command "cargo fmt -- --check"
 ```
 
-Only supplied fields and command categories are replaced.
+Only supplied fields and command categories are replaced. Add domain-specific categories with
+`--operation name=command`; operation steps may also carry `description`, `cwd`, and `env` when
+authored directly in the model.
 
 Record a decision:
 
@@ -87,7 +89,8 @@ Record a decision:
   --decision "Run candidate generation in the frontend." \
   --reason "The frontend owns input-session state." \
   --rejected "Run candidate generation in the backend" \
-  --evidence "file:src/candidates.rs"
+  --evidence "file:src/candidates.rs" \
+  --evidence-detail '{"ref":"conversation:codex:session#12","role":"rationale","observed_at":"2026-07-19T10:30:00+09:00"}'
 ```
 
 Record a meaningful experiment:
@@ -104,6 +107,15 @@ Use `--result inconclusive` for unresolved investigations.
 
 Use `commit:<sha>` only for an existing commit. For work in the current commit,
 citing a file, test, issue, or artifact is preferable to predicting a hash.
+Model entries may use the same structured `evidence` objects and typed `event_relations` to state
+whether an event is their origin, rationale, validation, implementation, or constraint.
+
+Legacy schema v1 stores remain readable. Before using structured evidence, typed relations, exact
+timestamps, or custom operations, migrate all four canonical files atomically:
+
+```bash
+.agents/skills/project-context/bin/project-context migrate
+```
 
 ## Validate
 

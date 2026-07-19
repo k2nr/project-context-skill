@@ -9,11 +9,15 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use time::{Date, OffsetDateTime, macros::format_description};
+use time::{
+    Date, OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description,
+};
 
 const MODEL_TEMPLATE: &str = include_str!("../../project-context/assets/init/model.yaml");
 const MODEL_SCHEMA: &str = include_str!("../../project-context/assets/init/model.schema.json");
 const EVENT_SCHEMA: &str = include_str!("../../project-context/assets/init/event.schema.json");
+const MODEL_SCHEMA_V1: &str = include_str!("schemas/model-v1.json");
+const EVENT_SCHEMA_V1: &str = include_str!("schemas/event-v1.json");
 
 const INIT_PATHS: [&str; 4] = [
     ".project-context/model.yaml",
@@ -41,6 +45,15 @@ pub struct ConfigureInput {
     pub test: Vec<String>,
     pub lint: Vec<String>,
     pub format: Vec<String>,
+    pub operations: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MigrateReport {
+    pub model_migrated: bool,
+    pub events_migrated: usize,
+    pub schemas_updated: bool,
+    pub no_op: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -79,10 +92,13 @@ pub struct DecisionInput {
     pub reason: String,
     pub id: Option<String>,
     pub date: Option<String>,
+    pub occurred_at: Option<String>,
     pub rejected: Vec<String>,
     pub supersedes: Vec<String>,
     pub conditions: Option<String>,
     pub evidence: Vec<String>,
+    pub evidence_details: Vec<Value>,
+    pub relations: Vec<Value>,
 }
 
 pub struct AttemptInput {
@@ -92,8 +108,11 @@ pub struct AttemptInput {
     pub finding: String,
     pub id: Option<String>,
     pub date: Option<String>,
+    pub occurred_at: Option<String>,
     pub conditions: Option<String>,
     pub evidence: Vec<String>,
+    pub evidence_details: Vec<Value>,
+    pub relations: Vec<Value>,
 }
 
 pub struct ReconstructionInput {
@@ -114,6 +133,7 @@ pub struct ReconstructionReport {
 #[derive(Clone, Copy)]
 enum TransactionKind {
     Init,
+    Migration,
     Reconstruction,
 }
 
@@ -121,6 +141,7 @@ impl TransactionKind {
     fn name(self) -> &'static str {
         match self {
             Self::Init => "init",
+            Self::Migration => "migration",
             Self::Reconstruction => "reconstruction",
         }
     }
@@ -128,6 +149,7 @@ impl TransactionKind {
     fn paths(self) -> &'static [&'static str] {
         match self {
             Self::Init => &INIT_PATHS,
+            Self::Migration => &INIT_PATHS,
             Self::Reconstruction => &RECONSTRUCTION_PATHS,
         }
     }
@@ -403,6 +425,7 @@ fn transaction_kind(root: &Path) -> Result<TransactionKind, String> {
     match fs::read_to_string(&marker) {
         Ok(value) => match value.as_str() {
             "init\n" => Ok(TransactionKind::Init),
+            "migration\n" => Ok(TransactionKind::Migration),
             "reconstruction\n" => Ok(TransactionKind::Reconstruction),
             other => Err(format!(
                 "unknown project-context transaction kind: {}",
@@ -573,16 +596,21 @@ pub fn configure(root: &Path, input: ConfigureInput) -> Result<ConfigureReport, 
         }
     }
 
-    let operation_updates = [
-        ("build", input.build),
-        ("test", input.test),
-        ("lint", input.lint),
-        ("format", input.format),
-    ];
-    if operation_updates
-        .iter()
-        .any(|(_, commands)| !commands.is_empty())
-    {
+    let schema_version = model_mapping
+        .get(serde_yaml_ng::Value::String("schema_version".to_owned()))
+        .and_then(serde_yaml_ng::Value::as_i64)
+        .unwrap_or(1);
+    let mut operation_updates = BTreeMap::from([
+        ("build".to_owned(), input.build),
+        ("test".to_owned(), input.test),
+        ("lint".to_owned(), input.lint),
+        ("format".to_owned(), input.format),
+    ]);
+    for (name, commands) in input.operations {
+        operation_updates.entry(name).or_default().extend(commands);
+    }
+    operation_updates.retain(|_, commands| !commands.is_empty());
+    if !operation_updates.is_empty() {
         let operations = model_mapping
             .get_mut(serde_yaml_ng::Value::String("operations".to_owned()))
             .and_then(serde_yaml_ng::Value::as_mapping_mut)
@@ -590,17 +618,32 @@ pub fn configure(root: &Path, input: ConfigureInput) -> Result<ConfigureReport, 
                 StoreError::Environment("model.yaml has no operations mapping".to_owned())
             })?;
         for (name, commands) in operation_updates {
-            if commands.is_empty() {
-                continue;
+            if schema_version == 1 && !["build", "test", "lint", "format"].contains(&name.as_str())
+            {
+                let _ = lock.unlock();
+                return Err(StoreError::Environment(format!(
+                    "custom operation '{name}' requires project-context migrate"
+                )));
             }
+            let commands = if schema_version == 1 {
+                commands
+                    .into_iter()
+                    .map(serde_yaml_ng::Value::String)
+                    .collect()
+            } else {
+                commands
+                    .into_iter()
+                    .map(|command| {
+                        serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::from_iter([(
+                            serde_yaml_ng::Value::String("command".to_owned()),
+                            serde_yaml_ng::Value::String(command),
+                        )]))
+                    })
+                    .collect()
+            };
             operations.insert(
                 serde_yaml_ng::Value::String(name.to_owned()),
-                serde_yaml_ng::Value::Sequence(
-                    commands
-                        .into_iter()
-                        .map(serde_yaml_ng::Value::String)
-                        .collect(),
-                ),
+                serde_yaml_ng::Value::Sequence(commands),
             );
             updated.push(format!("operations.{name}"));
         }
@@ -633,6 +676,170 @@ pub fn configure(root: &Path, input: ConfigureInput) -> Result<ConfigureReport, 
     }
     let _ = lock.unlock();
     Ok(ConfigureReport { updated })
+}
+
+pub fn migrate(root: &Path) -> Result<MigrateReport, StoreError> {
+    let lock = open_lock(root, true).map_err(StoreError::Environment)?;
+    recover_transaction(root).map_err(StoreError::Environment)?;
+    let documents = read_documents(root)?;
+    let (current_report, current_data) = inspect_documents(
+        &documents.model_schema,
+        &documents.event_schema,
+        &documents.model,
+        &documents.events,
+    );
+    if !current_report.valid {
+        let _ = lock.unlock();
+        return Err(StoreError::Invalid(current_report));
+    }
+
+    let mut model = current_data.model;
+    let model_migrated = model.get("schema_version").and_then(Value::as_u64) == Some(1);
+    if model_migrated {
+        migrate_model_value(&mut model);
+    }
+    let mut events = current_data.events;
+    let mut events_migrated = 0;
+    for event in &mut events {
+        if event.get("schema_version").and_then(Value::as_u64) == Some(1) {
+            migrate_event_value(event);
+            events_migrated += 1;
+        }
+    }
+    let schemas_updated = !schema_matches(&documents.model_schema, MODEL_SCHEMA)
+        || !schema_matches(&documents.event_schema, EVENT_SCHEMA);
+    let no_op = !model_migrated && events_migrated == 0 && !schemas_updated;
+    if no_op {
+        let _ = lock.unlock();
+        return Ok(MigrateReport {
+            model_migrated,
+            events_migrated,
+            schemas_updated,
+            no_op,
+        });
+    }
+
+    let proposed_model = serde_yaml_ng::to_string(&model).map_err(|error| {
+        StoreError::Environment(format!("cannot serialize migrated model: {error}"))
+    })?;
+    let proposed_events = serialize_event_values(&events)?;
+    let (proposed_report, _) = inspect_documents(
+        MODEL_SCHEMA,
+        EVENT_SCHEMA,
+        &proposed_model,
+        &proposed_events,
+    );
+    if !proposed_report.valid {
+        let _ = lock.unlock();
+        return Err(StoreError::Invalid(proposed_report));
+    }
+    transactional_replace(
+        root,
+        TransactionKind::Migration,
+        &[
+            proposed_model.into_bytes(),
+            proposed_events.into_bytes(),
+            MODEL_SCHEMA.as_bytes().to_vec(),
+            EVENT_SCHEMA.as_bytes().to_vec(),
+        ],
+    )
+    .map_err(StoreError::Environment)?;
+    let _ = lock.unlock();
+    Ok(MigrateReport {
+        model_migrated,
+        events_migrated,
+        schemas_updated,
+        no_op,
+    })
+}
+
+fn migrate_model_value(model: &mut Value) {
+    model["schema_version"] = Value::from(2);
+    for section in ["principles", "architecture", "behaviors", "constraints"] {
+        let Some(entries) = model.get_mut(section).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(object) = entry.as_object_mut() else {
+                continue;
+            };
+            if let Some(Value::Array(references)) = object.remove("related_events") {
+                object.insert(
+                    "event_relations".to_owned(),
+                    Value::Array(
+                        references
+                            .into_iter()
+                            .filter_map(|reference| reference.as_str().map(str::to_owned))
+                            .map(|event| {
+                                json_object([("event", event), ("kind", "related".to_owned())])
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(operations) = model.get_mut("operations").and_then(Value::as_object_mut) {
+        for steps in operations.values_mut() {
+            let Some(values) = steps.as_array_mut() else {
+                continue;
+            };
+            for step in values.iter_mut() {
+                if let Some(command) = step.as_str().map(str::to_owned) {
+                    *step = json_object([("command", command)]);
+                }
+            }
+        }
+    }
+}
+
+fn migrate_event_value(event: &mut Value) {
+    let Some(object) = event.as_object_mut() else {
+        return;
+    };
+    object.insert("schema_version".to_owned(), Value::from(2));
+    if let Some(Value::Array(evidence)) = object.get_mut("evidence") {
+        for item in evidence.iter_mut() {
+            if let Some(reference) = item.as_str().map(str::to_owned) {
+                *item = json_object([("ref", reference)]);
+            }
+        }
+    }
+    if let Some(Value::Array(supersedes)) = object.remove("supersedes") {
+        let relations = object
+            .entry("relations".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(relations) = relations.as_array_mut() {
+            relations.extend(
+                supersedes
+                    .into_iter()
+                    .filter_map(|target| target.as_str().map(str::to_owned))
+                    .map(|target| {
+                        json_object([("event", target), ("kind", "supersedes".to_owned())])
+                    }),
+            );
+        }
+    }
+}
+
+fn json_object<const N: usize>(pairs: [(&str, String); N]) -> Value {
+    Value::Object(
+        pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), Value::String(value)))
+            .collect(),
+    )
+}
+
+fn serialize_event_values(events: &[Value]) -> Result<String, StoreError> {
+    let mut output = String::new();
+    for event in events {
+        output.push_str(&serde_json::to_string(event).map_err(|error| {
+            StoreError::Environment(format!("cannot serialize event: {error}"))
+        })?);
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 pub fn apply_reconstruction(
@@ -734,8 +941,8 @@ pub fn apply_reconstruction(
         }
     }
 
-    // Stable date ordering preserves the evidence-derived candidate order within a day.
-    retained.sort_by_key(|event| event_date(event).to_owned());
+    // Stable ordering preserves evidence-derived order when only day precision exists.
+    retained.sort_by_key(event_timeline_key);
     let mut allocated_events = current_data.events.clone();
     for event in &mut retained {
         let Some(candidate_id) = event.get("id").and_then(Value::as_str).map(str::to_owned) else {
@@ -763,9 +970,9 @@ pub fn apply_reconstruction(
     for (candidate_id, matched_id, mut candidate, mut matched) in supersession_checks {
         remap_event_references(std::slice::from_mut(&mut candidate), &resolved_remap);
         remap_event_references(std::slice::from_mut(&mut matched), &resolved_remap);
-        if normalized_supersedes(&candidate) != normalized_supersedes(&matched) {
+        if normalized_relations(&candidate) != normalized_relations(&matched) {
             merge_errors.push(format!(
-                "proposed event '{candidate_id}' duplicates '{matched_id}' with different supersedes"
+                "proposed event '{candidate_id}' duplicates '{matched_id}' with different relations"
             ));
         }
     }
@@ -825,6 +1032,24 @@ fn event_date(event: &Value) -> &str {
     event.get("date").and_then(Value::as_str).unwrap_or("")
 }
 
+fn event_timeline_key(event: &Value) -> i128 {
+    if let Some(timestamp) = event
+        .get("occurred_at")
+        .and_then(Value::as_str)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+    {
+        return timestamp.unix_timestamp_nanos();
+    }
+    Date::parse(
+        event_date(event),
+        &format_description!("[year]-[month]-[day]"),
+    )
+    .ok()
+    .and_then(|date| date.with_hms(0, 0, 0).ok())
+    .map(|date_time| date_time.assume_utc().unix_timestamp_nanos())
+    .unwrap_or(i128::MIN)
+}
+
 fn merge_events_in_timeline_order(
     existing_text: &str,
     existing_events: &[Value],
@@ -832,7 +1057,7 @@ fn merge_events_in_timeline_order(
 ) -> Result<String, StoreError> {
     let already_ordered = existing_events
         .windows(2)
-        .all(|events| event_date(&events[0]) <= event_date(&events[1]));
+        .all(|events| event_timeline_key(&events[0]) <= event_timeline_key(&events[1]));
     if new_events.is_empty() && already_ordered {
         return Ok(existing_text.to_owned());
     }
@@ -843,18 +1068,18 @@ fn merge_events_in_timeline_order(
             "cannot align canonical event lines with parsed events".to_owned(),
         ));
     }
-    let mut lines: Vec<(String, String)> = existing_events
+    let mut lines: Vec<(i128, String)> = existing_events
         .iter()
         .zip(existing_lines)
-        .map(|(event, line)| (event_date(event).to_owned(), line.to_owned()))
+        .map(|(event, line)| (event_timeline_key(event), line.to_owned()))
         .collect();
     for event in new_events {
         let line = serde_json::to_string(event)
             .map_err(|error| StoreError::Environment(format!("cannot serialize event: {error}")))?;
-        lines.push((event_date(event).to_owned(), line));
+        lines.push((event_timeline_key(event), line));
     }
     // Rust's stable sort retains canonical or candidate order when only day precision exists.
-    lines.sort_by(|left, right| left.0.cmp(&right.0));
+    lines.sort_by_key(|line| line.0);
     Ok(lines
         .into_iter()
         .map(|(_, line)| line)
@@ -967,17 +1192,20 @@ fn validate_model_merge(base: &Value, proposed: &Value) -> Vec<String> {
             ));
         }
     }
-    for operation in ["build", "test", "lint", "format"] {
-        let pointer = format!("/operations/{operation}");
-        if let Some(base_value) = base.pointer(&pointer)
-            && base_value
+    if let Some(operations) = base.get("operations").and_then(Value::as_object) {
+        for (operation, base_value) in operations {
+            if base_value
                 .as_array()
                 .is_some_and(|values| !values.is_empty())
-            && proposed.pointer(&pointer) != Some(base_value)
-        {
-            errors.push(format!(
-                "proposed model changes non-empty operations.{operation}"
-            ));
+                && proposed
+                    .get("operations")
+                    .and_then(|value| value.get(operation))
+                    != Some(base_value)
+            {
+                errors.push(format!(
+                    "proposed model changes non-empty operations.{operation}"
+                ));
+            }
         }
     }
     if proposed.get("extensions") != base.get("extensions") {
@@ -1039,6 +1267,7 @@ fn event_dedupe_key(event: &Value) -> Option<String> {
     let object = value.as_object_mut()?;
     object.remove("id");
     object.remove("supersedes");
+    object.remove("relations");
     normalize_semantic_value(&mut value);
     serde_json::to_string(&value).ok()
 }
@@ -1063,14 +1292,32 @@ fn normalize_semantic_value(value: &mut Value) {
     }
 }
 
-fn normalized_supersedes(event: &Value) -> Vec<String> {
-    let mut values: Vec<String> = event
+fn normalized_relations(event: &Value) -> Vec<String> {
+    let mut values: Vec<Value> = event
         .get("supersedes")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .map(str::to_owned)
+        .map(|event| {
+            json_object([
+                ("event", event.to_owned()),
+                ("kind", "supersedes".to_owned()),
+            ])
+        })
+        .collect();
+    values.extend(
+        event
+            .get("relations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    values.iter_mut().for_each(normalize_semantic_value);
+    let mut values: Vec<String> = values
+        .into_iter()
+        .filter_map(|value| serde_json::to_string(&value).ok())
         .collect();
     values.sort();
     values.dedup();
@@ -1088,23 +1335,10 @@ fn remap_event_references(events: &mut [Value], remap: &BTreeMap<String, String>
                 }
             }
         }
-    }
-}
-
-fn remap_model_references(model: &mut Value, remap: &BTreeMap<String, String>) {
-    for section in ["principles", "architecture", "behaviors", "constraints"] {
-        let Some(entries) = model.get_mut(section).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for entry in entries {
-            let Some(references) = entry
-                .get_mut("related_events")
-                .and_then(Value::as_array_mut)
-            else {
-                continue;
-            };
-            for reference in references {
-                if let Some(id) = reference.as_str()
+        if let Some(relations) = event.get_mut("relations").and_then(Value::as_array_mut) {
+            for relation in relations {
+                if let Some(reference) = relation.get_mut("event")
+                    && let Some(id) = reference.as_str()
                     && let Some(replacement) = remap.get(id)
                 {
                     *reference = Value::String(replacement.clone());
@@ -1114,41 +1348,98 @@ fn remap_model_references(model: &mut Value, remap: &BTreeMap<String, String>) {
     }
 }
 
+fn remap_model_references(model: &mut Value, remap: &BTreeMap<String, String>) {
+    for section in ["principles", "architecture", "behaviors", "constraints"] {
+        let Some(entries) = model.get_mut(section).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(references) = entry
+                .get_mut("related_events")
+                .and_then(Value::as_array_mut)
+            {
+                for reference in references {
+                    if let Some(id) = reference.as_str()
+                        && let Some(replacement) = remap.get(id)
+                    {
+                        *reference = Value::String(replacement.clone());
+                    }
+                }
+            }
+            if let Some(relations) = entry
+                .get_mut("event_relations")
+                .and_then(Value::as_array_mut)
+            {
+                for relation in relations {
+                    if let Some(reference) = relation.get_mut("event")
+                        && let Some(id) = reference.as_str()
+                        && let Some(replacement) = remap.get(id)
+                    {
+                        *reference = Value::String(replacement.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn add_decision(root: &Path, input: DecisionInput) -> Result<Value, StoreError> {
-    append_event(root, move |events| {
+    append_event(root, move |events, schema_version| {
         let mut event = base_event(
             "decision",
             input.id,
             input.date,
+            input.occurred_at,
             &input.subject,
-            "D",
             events,
+            schema_version,
         )?;
         event.insert("decision".to_owned(), Value::String(input.decision));
         event.insert("reason".to_owned(), Value::String(input.reason));
         insert_array(&mut event, "rejected", input.rejected);
-        insert_array(&mut event, "supersedes", input.supersedes);
         insert_optional(&mut event, "conditions", input.conditions);
-        insert_array(&mut event, "evidence", input.evidence);
+        insert_event_metadata(
+            &mut event,
+            schema_version,
+            input.evidence,
+            input.evidence_details,
+            input.supersedes,
+            input.relations,
+        )?;
         Ok(Value::Object(event))
     })
 }
 
 pub fn add_attempt(root: &Path, input: AttemptInput) -> Result<Value, StoreError> {
-    append_event(root, move |events| {
-        let mut event = base_event("attempt", input.id, input.date, &input.subject, "A", events)?;
+    append_event(root, move |events, schema_version| {
+        let mut event = base_event(
+            "attempt",
+            input.id,
+            input.date,
+            input.occurred_at,
+            &input.subject,
+            events,
+            schema_version,
+        )?;
         event.insert("approach".to_owned(), Value::String(input.approach));
         event.insert("result".to_owned(), Value::String(input.result));
         event.insert("finding".to_owned(), Value::String(input.finding));
         insert_optional(&mut event, "conditions", input.conditions);
-        insert_array(&mut event, "evidence", input.evidence);
+        insert_event_metadata(
+            &mut event,
+            schema_version,
+            input.evidence,
+            input.evidence_details,
+            Vec::new(),
+            input.relations,
+        )?;
         Ok(Value::Object(event))
     })
 }
 
 fn append_event<F>(root: &Path, create: F) -> Result<Value, StoreError>
 where
-    F: FnOnce(&[Value]) -> Result<Value, String>,
+    F: FnOnce(&[Value], u64) -> Result<Value, String>,
 {
     let lock = open_lock(root, true).map_err(StoreError::Environment)?;
     recover_transaction(root).map_err(StoreError::Environment)?;
@@ -1165,7 +1456,12 @@ where
         return Err(StoreError::Invalid(current_report));
     }
 
-    let event = create(&data.events).map_err(StoreError::Environment)?;
+    let schema_version = data
+        .model
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let event = create(&data.events, schema_version).map_err(StoreError::Environment)?;
     let proposed_events = merge_events_in_timeline_order(
         &documents.events,
         &data.events,
@@ -1199,22 +1495,78 @@ fn base_event(
     kind: &str,
     requested_id: Option<String>,
     requested_date: Option<String>,
+    occurred_at: Option<String>,
     subject: &str,
-    prefix: &str,
     events: &[Value],
+    schema_version: u64,
 ) -> Result<Map<String, Value>, String> {
+    let prefix = match kind {
+        "decision" => "D",
+        "attempt" => "A",
+        _ => return Err(format!("unsupported event type '{kind}'")),
+    };
     let id = match requested_id {
         Some(id) => id,
         None => next_event_id(prefix, events)?,
     };
-    let date = requested_date.unwrap_or_else(|| OffsetDateTime::now_utc().date().to_string());
+    let date = requested_date
+        .or_else(|| {
+            occurred_at
+                .as_deref()
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                .map(|timestamp| timestamp.date().to_string())
+        })
+        .unwrap_or_else(|| OffsetDateTime::now_utc().date().to_string());
     let mut event = Map::new();
-    event.insert("schema_version".to_owned(), Value::from(1));
+    event.insert("schema_version".to_owned(), Value::from(schema_version));
     event.insert("type".to_owned(), Value::String(kind.to_owned()));
     event.insert("id".to_owned(), Value::String(id));
     event.insert("date".to_owned(), Value::String(date));
+    if let Some(occurred_at) = occurred_at {
+        if schema_version == 1 {
+            return Err("--occurred-at requires project-context migrate".to_owned());
+        }
+        event.insert("occurred_at".to_owned(), Value::String(occurred_at));
+    }
     event.insert("subject".to_owned(), Value::String(subject.to_owned()));
     Ok(event)
+}
+
+fn insert_event_metadata(
+    event: &mut Map<String, Value>,
+    schema_version: u64,
+    evidence: Vec<String>,
+    evidence_details: Vec<Value>,
+    supersedes: Vec<String>,
+    mut relations: Vec<Value>,
+) -> Result<(), String> {
+    if schema_version == 1 {
+        if !evidence_details.is_empty() || !relations.is_empty() {
+            return Err(
+                "structured evidence and relations require project-context migrate".to_owned(),
+            );
+        }
+        insert_array(event, "supersedes", supersedes);
+        insert_array(event, "evidence", evidence);
+        return Ok(());
+    }
+    let mut evidence_values: Vec<Value> = evidence
+        .into_iter()
+        .map(|reference| json_object([("ref", reference)]))
+        .collect();
+    evidence_values.extend(evidence_details);
+    if !evidence_values.is_empty() {
+        event.insert("evidence".to_owned(), Value::Array(evidence_values));
+    }
+    relations.extend(
+        supersedes
+            .into_iter()
+            .map(|target| json_object([("event", target), ("kind", "supersedes".to_owned())])),
+    );
+    if !relations.is_empty() {
+        event.insert("relations".to_owned(), Value::Array(relations));
+    }
+    Ok(())
 }
 
 fn next_event_id(prefix: &str, events: &[Value]) -> Result<String, String> {
@@ -1447,20 +1799,24 @@ fn inspect_documents(
     events_text: &str,
 ) -> (ValidationReport, RepositoryData) {
     let mut report = ValidationReport::default();
-    validate_canonical_schema_copy(
+    let model_schema = accepted_schema(
         "model.schema.json",
         model_schema_text,
         MODEL_SCHEMA,
+        MODEL_SCHEMA_V1,
         &mut report,
     );
-    validate_canonical_schema_copy(
+    let event_schema = accepted_schema(
         "event.schema.json",
         event_schema_text,
         EVENT_SCHEMA,
+        EVENT_SCHEMA_V1,
         &mut report,
     );
-    let model_validator = compile_schema("embedded model.schema.json", MODEL_SCHEMA, &mut report);
-    let event_validator = compile_schema("embedded event.schema.json", EVENT_SCHEMA, &mut report);
+    let model_validator = model_schema
+        .and_then(|schema| compile_schema("embedded model.schema.json", schema, &mut report));
+    let event_validator = event_schema
+        .and_then(|schema| compile_schema("embedded event.schema.json", schema, &mut report));
 
     let model = match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(model_text) {
         Ok(model_yaml) => match serde_json::to_value(model_yaml) {
@@ -1517,32 +1873,59 @@ fn inspect_documents(
     (report, RepositoryData { model, events })
 }
 
-fn validate_canonical_schema_copy(
+fn accepted_schema(
     label: &str,
     content: &str,
-    canonical: &str,
+    current: &'static str,
+    legacy: &'static str,
     report: &mut ValidationReport,
-) {
+) -> Option<&'static str> {
     let local = serde_json::from_str::<Value>(content);
-    let embedded = serde_json::from_str::<Value>(canonical).expect("embedded schema is valid JSON");
+    let current_value =
+        serde_json::from_str::<Value>(current).expect("embedded current schema is valid JSON");
+    let legacy_value =
+        serde_json::from_str::<Value>(legacy).expect("embedded legacy schema is valid JSON");
     match local {
-        Ok(local) if local == embedded => {}
-        Ok(_) => report.errors.push(format!(
-            "{label} differs from the canonical embedded v1 schema"
-        )),
-        Err(error) => report
-            .errors
-            .push(format!("{label} is not valid JSON: {error}")),
+        Ok(local) if local == current_value => Some(current),
+        Ok(local) if local == legacy_value => Some(legacy),
+        Ok(_) => {
+            report.errors.push(format!(
+                "{label} differs from the supported embedded schemas"
+            ));
+            None
+        }
+        Err(error) => {
+            report
+                .errors
+                .push(format!("{label} is not valid JSON: {error}"));
+            None
+        }
     }
 }
 
+fn schema_matches(content: &str, canonical: &str) -> bool {
+    serde_json::from_str::<Value>(content).ok() == serde_json::from_str::<Value>(canonical).ok()
+}
+
+fn evidence_reference(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("ref").and_then(Value::as_str))
+}
+
 fn add_git_validation_warnings(root: &Path, data: &RepositoryData, report: &mut ValidationReport) {
-    let evidence: BTreeSet<String> = data
+    let event_evidence = data
         .events
         .iter()
         .filter_map(|event| event.get("evidence").and_then(Value::as_array))
-        .flatten()
-        .filter_map(Value::as_str)
+        .flatten();
+    let model_evidence = model_entries(&data.model)
+        .into_iter()
+        .filter_map(|entry| entry.get("evidence").and_then(Value::as_array))
+        .flatten();
+    let evidence: BTreeSet<String> = event_evidence
+        .chain(model_evidence)
+        .filter_map(evidence_reference)
         .filter_map(|item| item.strip_prefix("commit:"))
         .filter(|commit| !commit.is_empty())
         .map(str::to_owned)
@@ -1656,6 +2039,18 @@ fn validate_cross_records(model: &Value, events: &[Value], errors: &mut Vec<Stri
                 "event date '{date}' is not a valid ISO calendar date"
             ));
         }
+        if let (Some(date), Some(occurred_at)) = (
+            event.get("date").and_then(Value::as_str),
+            event.get("occurred_at").and_then(Value::as_str),
+        ) && let (Ok(date), Ok(timestamp)) = (
+            Date::parse(date, &format_description!("[year]-[month]-[day]")),
+            OffsetDateTime::parse(occurred_at, &Rfc3339),
+        ) && date != timestamp.date()
+        {
+            errors.push(format!(
+                "event occurred_at '{occurred_at}' does not fall on its date '{date}'"
+            ));
+        }
         if let (Some(id), Some(kind)) = (
             event.get("id").and_then(Value::as_str),
             event.get("type").and_then(Value::as_str),
@@ -1681,19 +2076,28 @@ fn validate_cross_records(model: &Value, events: &[Value], errors: &mut Vec<Stri
                         }
                     }
                 }
+                if let Some(relations) = entry.get("event_relations").and_then(Value::as_array) {
+                    for reference in relations
+                        .iter()
+                        .filter_map(|relation| relation.get("event").and_then(Value::as_str))
+                    {
+                        if !event_types.contains_key(reference) {
+                            errors.push(format!(
+                                "model entry '{entry_id}' references missing event '{reference}'"
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
 
     let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for event in events {
-        if event.get("type").and_then(Value::as_str) != Some("decision") {
-            continue;
-        }
         let Some(id) = event.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let supersedes: Vec<String> = event
+        let mut supersedes: Vec<String> = event
             .get("supersedes")
             .and_then(Value::as_array)
             .into_iter()
@@ -1701,6 +2105,37 @@ fn validate_cross_records(model: &Value, events: &[Value], errors: &mut Vec<Stri
             .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();
+        if let Some(relations) = event.get("relations").and_then(Value::as_array) {
+            for relation in relations {
+                let Some(target) = relation.get("event").and_then(Value::as_str) else {
+                    continue;
+                };
+                let kind = relation
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("related");
+                if target == id {
+                    errors.push(format!("event '{id}' cannot relate to itself"));
+                } else if !event_types.contains_key(target) {
+                    errors.push(format!(
+                        "event '{id}' relation '{kind}' references missing event '{target}'"
+                    ));
+                }
+                if matches!(kind, "supersedes" | "partially_supersedes") {
+                    if event.get("type").and_then(Value::as_str) != Some("decision")
+                        || event_types.get(target).map(String::as_str) != Some("decision")
+                    {
+                        errors.push(format!(
+                            "event '{id}' relation '{kind}' must connect two decisions"
+                        ));
+                    }
+                    supersedes.push(target.to_owned());
+                }
+            }
+        }
+        if event.get("type").and_then(Value::as_str) != Some("decision") {
+            continue;
+        }
         for target in &supersedes {
             if target == id {
                 errors.push(format!("decision '{id}' cannot supersede itself"));
@@ -1873,6 +2308,18 @@ mod tests {
             )
             .expect("copy fixture file");
         }
+        write(
+            &directory
+                .path()
+                .join(".project-context/schemas/model.schema.json"),
+            MODEL_SCHEMA_V1,
+        );
+        write(
+            &directory
+                .path()
+                .join(".project-context/schemas/event.schema.json"),
+            EVENT_SCHEMA_V1,
+        );
         directory
     }
 
@@ -1883,10 +2330,13 @@ mod tests {
             reason: "It preserves ownership.".to_owned(),
             id: None,
             date: Some("2026-07-17".to_owned()),
+            occurred_at: None,
             rejected: Vec::new(),
             supersedes: Vec::new(),
             conditions: None,
             evidence: Vec::new(),
+            evidence_details: Vec::new(),
+            relations: Vec::new(),
         }
     }
 
@@ -1898,8 +2348,11 @@ mod tests {
             finding: "The callback was not delivered.".to_owned(),
             id: None,
             date: Some("2026-07-17".to_owned()),
+            occurred_at: None,
             conditions: None,
             evidence: Vec::new(),
+            evidence_details: Vec::new(),
+            relations: Vec::new(),
         }
     }
 
@@ -2119,7 +2572,7 @@ mod tests {
             validate(&schema_directory)
                 .errors
                 .iter()
-                .any(|error| error.contains("canonical embedded v1 schema"))
+                .any(|error| error.contains("supported embedded schemas"))
         );
 
         let duplicate_directory = initialized();
@@ -2128,7 +2581,7 @@ mod tests {
                 .path()
                 .join(".project-context/events.jsonl"),
             concat!(
-                "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",",
+                "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-1\",",
                 "\"date\":\"2026-07-17\",\"subject\":\"x\",",
                 "\"decision\":\"first\",\"decision\":\"second\",\"reason\":\"x\"}\n"
             ),
@@ -2145,7 +2598,7 @@ mod tests {
     fn generated_event_ids_have_no_integer_ceiling() {
         let directory = initialized();
         let existing = concat!(
-            "{\"schema_version\":1,\"type\":\"decision\",",
+            "{\"schema_version\":2,\"type\":\"decision\",",
             "\"id\":\"D-184467440737095516160000\",\"date\":\"2026-07-17\",",
             "\"subject\":\"old\",\"decision\":\"old\",\"reason\":\"old\"}\n"
         );
@@ -2218,11 +2671,12 @@ mod tests {
     #[test]
     fn validation_rejects_unknown_fields_versions_ids_and_dates() {
         let cases = [
-            json!({"schema_version":1,"type":"gap","id":"G-1","date":"2026-07-17","subject":"x"}),
-            json!({"schema_version":1,"type":"decision","id":"A-1","date":"2026-07-17","subject":"x","decision":"x","reason":"x"}),
-            json!({"schema_version":2,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x"}),
-            json!({"schema_version":1,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x","unknown":true}),
-            json!({"schema_version":1,"type":"attempt","id":"A-1","date":"2026-99-99","subject":"x","approach":"x","result":"failed","finding":"x"}),
+            json!({"schema_version":2,"type":"gap","id":"G-1","date":"2026-07-17","subject":"x"}),
+            json!({"schema_version":2,"type":"decision","id":"A-1","date":"2026-07-17","subject":"x","decision":"x","reason":"x"}),
+            json!({"schema_version":3,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x"}),
+            json!({"schema_version":2,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x","unknown":true}),
+            json!({"schema_version":2,"type":"attempt","id":"A-1","date":"2026-99-99","subject":"x","approach":"x","result":"failed","finding":"x"}),
+            json!({"schema_version":2,"type":"attempt","id":"A-1","date":"2026-07-17","occurred_at":"2026-07-18T00:00:00+09:00","subject":"x","approach":"x","result":"failed","finding":"x"}),
         ];
         for event in cases {
             let directory = initialized();
@@ -2348,7 +2802,7 @@ mod tests {
     #[test]
     fn add_decision_allocates_id_and_preserves_existing_lines() {
         let directory = initialized();
-        let existing = "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-9\",\"date\":\"2026-07-16\",\"subject\":\"old\",\"decision\":\"old\",\"reason\":\"old\"}\n";
+        let existing = "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-9\",\"date\":\"2026-07-16\",\"subject\":\"old\",\"decision\":\"old\",\"reason\":\"old\"}\n";
         write(
             &directory.path().join(".project-context/events.jsonl"),
             existing,
@@ -2370,7 +2824,7 @@ mod tests {
         let directory = initialized();
         write(
             &directory.path().join(".project-context/events.jsonl"),
-            "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-06-27\",\"subject\":\"later\",\"decision\":\"later\",\"reason\":\"later\"}\n",
+            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-06-27\",\"subject\":\"later\",\"decision\":\"later\",\"reason\":\"later\"}\n",
         );
         let mut input = attempt("inconclusive");
         input.id = Some("A-42".to_owned());

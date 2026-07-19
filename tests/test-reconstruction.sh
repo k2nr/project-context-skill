@@ -207,7 +207,7 @@ missing_candidate_status=$?
 set -e
 [ "$missing_candidate_status" -eq 2 ]
 printf '%s\n' \
-  '{"schema_version":1,"type":"decision","id":"candidate:local-dependency","date":"2026-07-19","subject":"local dependency boundary","decision":"Use local binaries.","reason":"Target repositories must not need build tools.","evidence":["conversation:codex:codex-related#1","conversation:claude:claude-related#0"]}' \
+  '{"schema_version":2,"type":"decision","id":"candidate:local-dependency","date":"2026-07-19","occurred_at":"2026-07-19T10:00:00Z","subject":"local dependency boundary","decision":"Use local binaries.","reason":"Target repositories must not need build tools.","evidence":[{"ref":"conversation:codex:codex-related#1","role":"choice"},{"ref":"conversation:claude:claude-related#0","role":"rationale"}]}' \
   > "$candidate_events"
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
   verify-candidates --inventory "$inventory" --events "$candidate_events" >/dev/null
