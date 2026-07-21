@@ -4,25 +4,84 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing immutable release tag to recover"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  test:
+  resolve:
     runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      release_tag_object_sha: ${{ steps.resolve.outputs.release_tag_object_sha }}
+      release_sha: ${{ steps.resolve.outputs.release_sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Resolve immutable release tag
+        id: resolve
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "${REQUESTED_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'invalid release tag: %s\n' "${REQUESTED_TAG}" >&2
+            exit 1
+          fi
+          git fetch --force --no-tags origin \
+            "refs/tags/${REQUESTED_TAG}:refs/tags/${REQUESTED_TAG}"
+          release_tag_object_sha=$(git rev-parse "refs/tags/${REQUESTED_TAG}")
+          test "$(git cat-file -t "${release_tag_object_sha}")" = "tag"
+          release_sha=$(git rev-parse "refs/tags/${REQUESTED_TAG}^{commit}")
+          git cat-file -e "${release_sha}^{commit}"
+          remote_tag_object_sha=$(git ls-remote origin "refs/tags/${REQUESTED_TAG}" | awk 'NR == 1 { print $1 }')
+          remote_release_sha=$(git ls-remote origin "refs/tags/${REQUESTED_TAG}^{}" | awk 'NR == 1 { print $1 }')
+          test "${remote_tag_object_sha}" = "${release_tag_object_sha}"
+          test "${remote_release_sha}" = "${release_sha}"
+          printf 'release_tag=%s\n' "${REQUESTED_TAG}" >> "${GITHUB_OUTPUT}"
+          printf 'release_tag_object_sha=%s\n' "${release_tag_object_sha}" >> "${GITHUB_OUTPUT}"
+          printf 'release_sha=%s\n' "${release_sha}" >> "${GITHUB_OUTPUT}"
+
+  test:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_SHA: ${{ needs.resolve.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.resolve.outputs.release_sha }}
+          persist-credentials: false
+      - name: Verify checked-out release commit
+        run: test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
       - name: Install skill validation dependency
         run: |
           sudo apt-get update
           sudo apt-get install --yes python3-yaml
+      - name: Install pinned ShellCheck
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz \
+            --output /tmp/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          printf '%s  %s\n' \
+            8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198 \
+            /tmp/shellcheck-v0.11.0.linux.x86_64.tar.xz \
+            | sha256sum --check --strict -
+          tar -xJf /tmp/shellcheck-v0.11.0.linux.x86_64.tar.xz -C /tmp
+          sudo install -m 0755 /tmp/shellcheck-v0.11.0/shellcheck /usr/local/bin/shellcheck
+          test "$(shellcheck --version | sed -n 's/^version: //p')" = "0.11.0"
       - name: Verify project
         run: bin/check verify
       - name: Audit Rust dependencies
@@ -35,7 +94,7 @@ jobs:
           "$(go env GOPATH)/bin/actionlint" .github/workflows/release.yml
 
   build-linux:
-    needs: test
+    needs: [resolve, test]
     strategy:
       fail-fast: false
       matrix:
@@ -47,12 +106,18 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container:
       image: rust:1.95.0-slim-bullseye@sha256:a9bd605cd31827c6c20d145d7ba0c0c5ec66827ad26894a8f07d5575f3110c1d
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      RELEASE_SHA: ${{ needs.resolve.outputs.release_sha }}
     steps:
       - name: Install build utilities
         run: apt-get update && apt-get install --yes ca-certificates curl file git
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ needs.resolve.outputs.release_sha }}
           persist-credentials: false
+      - name: Verify checked-out release commit
+        run: test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
       - name: Build release binary
         run: |
           rustup target add "${{ matrix.target }}"
@@ -70,7 +135,7 @@ jobs:
           tests/test-bootstrap.sh project-context/bin/project-context
       - name: Prepare release assets
         run: |
-          asset="project-context-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          asset="project-context-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p release-assets
           cp "cli/target/${{ matrix.target }}/release/project-context" "release-assets/${asset}"
           (cd release-assets && sha256sum "${asset}" > "${asset}.sha256")
@@ -81,7 +146,7 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    needs: test
+    needs: [resolve, test]
     strategy:
       fail-fast: false
       matrix:
@@ -93,10 +158,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      RELEASE_SHA: ${{ needs.resolve.outputs.release_sha }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ needs.resolve.outputs.release_sha }}
           persist-credentials: false
+      - name: Verify checked-out release commit
+        run: test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
       - name: Build release binary
         run: |
           rustup target add "${{ matrix.target }}"
@@ -114,7 +184,7 @@ jobs:
           tests/test-bootstrap.sh project-context/bin/project-context
       - name: Prepare release assets
         run: |
-          asset="project-context-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          asset="project-context-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p release-assets
           cp "cli/target/${{ matrix.target }}/release/project-context" "release-assets/${asset}"
           (cd release-assets && shasum -a 256 "${asset}" > "${asset}.sha256")
@@ -125,8 +195,12 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [build-linux, build-macos]
+    needs: [resolve, build-linux, build-macos]
     runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+      RELEASE_TAG_OBJECT_SHA: ${{ needs.resolve.outputs.release_tag_object_sha }}
+      RELEASE_SHA: ${{ needs.resolve.outputs.release_sha }}
     permissions:
       contents: write
       id-token: write
@@ -134,6 +208,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
+          ref: ${{ needs.resolve.outputs.release_sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
@@ -143,22 +218,30 @@ jobs:
           merge-multiple: true
       - name: Verify release identity and tag
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           package_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' cli/Cargo.toml | head -n 1)
           launcher_version=$(sed -n 's/^PROJECT_CONTEXT_VERSION="\([^"]*\)"/\1/p' project-context/bin/project-context | head -n 1)
           installer_version=$(sed -n 's/^PROJECT_CONTEXT_VERSION="\([^"]*\)"/\1/p' bin/install-project-context | head -n 1)
-          test "${GITHUB_REF_NAME}" = "v${package_version}"
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+          test "${RELEASE_TAG}" = "v${package_version}"
           test "${package_version}" = "${launcher_version}"
           test "${package_version}" = "${installer_version}"
-          test "$(git rev-list -n 1 "${GITHUB_REF_NAME}")" = "${GITHUB_SHA}"
-          remote_tag_sha=$(git ls-remote origin "refs/tags/${GITHUB_REF_NAME}^{}" | awk 'NR == 1 { print $1 }')
-          if test -z "${remote_tag_sha}"; then
-            remote_tag_sha=$(git ls-remote origin "refs/tags/${GITHUB_REF_NAME}" | awk 'NR == 1 { print $1 }')
-          fi
-          test "${remote_tag_sha}" = "${GITHUB_SHA}"
+          test "$(git rev-parse "refs/tags/${RELEASE_TAG}")" = "${RELEASE_TAG_OBJECT_SHA}"
+          test "$(git cat-file -t "${RELEASE_TAG_OBJECT_SHA}")" = "tag"
+          test "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")" = "${RELEASE_SHA}"
+          remote_tag_object_sha=$(git ls-remote origin "refs/tags/${RELEASE_TAG}" | awk 'NR == 1 { print $1 }')
+          remote_release_sha=$(git ls-remote origin "refs/tags/${RELEASE_TAG}^{}" | awk 'NR == 1 { print $1 }')
+          test "${remote_tag_object_sha}" = "${RELEASE_TAG_OBJECT_SHA}"
+          test "${remote_release_sha}" = "${RELEASE_SHA}"
           default_branch="${{ github.event.repository.default_branch }}"
           git fetch --no-tags origin "${default_branch}"
-          git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${default_branch}"
+          git merge-base --is-ancestor "${RELEASE_SHA}" "origin/${default_branch}"
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            printf 'release already exists: %s\n' "${RELEASE_TAG}" >&2
+            exit 1
+          fi
           if grep -R -E 'PENDING_GITHUB_REPOSITORY|OWNER/REPOSITORY' README.md project-context; then
             printf 'release placeholders remain in public package files\n' >&2
             exit 1
@@ -168,12 +251,12 @@ jobs:
           grep -Fq "github.com/${GITHUB_REPOSITORY}" README.md
       - name: Package project-installed skill
         run: |
-          bin/package-skill "${GITHUB_REF_NAME#v}" release-assets
-          bin/package-installer "${GITHUB_REF_NAME#v}" release-assets
+          bin/package-skill "${RELEASE_TAG#v}" release-assets
+          bin/package-installer "${RELEASE_TAG#v}" release-assets
       - name: Verify release assets
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME}"
+          version="${RELEASE_TAG}"
           cat > expected-assets.txt <<EOF
           install-project-context-${version}
           install-project-context-${version}.sha256
@@ -195,13 +278,88 @@ jobs:
           tests/test-package.sh "release-assets/project-context-skill-${version}.tar.gz"
           tests/test-installer-package.sh
       - name: Attest release assets
+        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: release-assets/*
+      - name: Record recovery SLSA provenance
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RECOVERY_GIT_REF: ${{ github.ref }}
+          RECOVERY_WORKFLOW_SHA: ${{ github.sha }}
+          RECOVERY_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          jq -n \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg release_tag "${RELEASE_TAG}" \
+            --arg release_tag_object_sha "${RELEASE_TAG_OBJECT_SHA}" \
+            --arg source_commit "${RELEASE_SHA}" \
+            --arg recovery_git_ref "${RECOVERY_GIT_REF}" \
+            --arg workflow_commit "${RECOVERY_WORKFLOW_SHA}" \
+            --arg workflow_ref "${RECOVERY_WORKFLOW_REF}" \
+            --arg server_url "${GITHUB_SERVER_URL}" \
+            --arg invocation_id "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+            '{
+              buildDefinition: {
+                buildType: "https://actions.github.io/buildtypes/workflow/v1",
+                externalParameters: {
+                  workflow: {
+                    ref: $recovery_git_ref,
+                    repository: ($server_url + "/" + $repository),
+                    path: ".github/workflows/release.yml"
+                  },
+                  inputs: {release_tag: $release_tag}
+                },
+                internalParameters: {github: {event_name: "workflow_dispatch"}},
+                resolvedDependencies: [
+                  {
+                    uri: ("git+" + $server_url + "/" + $repository + "@" + $recovery_git_ref),
+                    digest: {gitCommit: $workflow_commit},
+                    annotations: {role: "buildConfiguration", workflow: $workflow_ref}
+                  },
+                  {
+                    uri: ("git+" + $server_url + "/" + $repository + "@refs/tags/" + $release_tag),
+                    digest: {gitCommit: $source_commit},
+                    annotations: {releaseTagObjectSha: $release_tag_object_sha, role: "source"}
+                  }
+                ]
+              },
+              runDetails: {
+                builder: {id: ($server_url + "/" + $workflow_ref)},
+                metadata: {invocationId: $invocation_id}
+              }
+            }' > recovery-slsa-provenance.json
+      - name: Attest recovery SLSA provenance
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: release-assets/*
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: recovery-slsa-provenance.json
+      - name: Record release source identity
+        env:
+          RECOVERY_WORKFLOW_SHA: ${{ github.sha }}
+          RECOVERY_WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          jq -n \
+            --arg release_tag "${RELEASE_TAG}" \
+            --arg release_tag_object_sha "${RELEASE_TAG_OBJECT_SHA}" \
+            --arg source_commit "${RELEASE_SHA}" \
+            --arg workflow_commit "${RECOVERY_WORKFLOW_SHA}" \
+            --arg workflow_ref "${RECOVERY_WORKFLOW_REF}" \
+            --arg trigger "${GITHUB_EVENT_NAME}" \
+            '{release_tag: $release_tag, release_tag_object_sha: $release_tag_object_sha, source_commit: $source_commit, recovery_workflow_commit: $workflow_commit, recovery_workflow_ref: $workflow_ref, trigger: $trigger}' \
+            > release-source-predicate.json
+      - name: Attest release source identity
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: release-assets/*
+          predicate-type: https://github.com/k2nr/project-context-skill/attestations/release-source/v1
+          predicate-path: release-source-predicate.json
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" release-assets/* \
-            --draft --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
-          gh release edit "${GITHUB_REF_NAME}" --draft=false
+          gh release create "${RELEASE_TAG}" release-assets/* \
+            --draft --verify-tag --generate-notes --title "${RELEASE_TAG}"
+          gh release edit "${RELEASE_TAG}" --draft=false
