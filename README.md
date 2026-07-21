@@ -23,7 +23,7 @@ The official GitHub repository is `k2nr/project-context-skill`.
 Copy this instruction verbatim:
 
 ```text
-Install Project Context v0.1.7 into the current repository.
+Install Project Context v0.2.0 into the current repository.
 
 Official GitHub repository:
 k2nr/project-context-skill
@@ -33,13 +33,13 @@ Installation requirements:
    project ID, concise description, and real build, test, lint, and format
    commands. Explicitly identify any operation category that intentionally has
    no command.
-2. Download these assets for tag v0.1.7 into a private temporary directory:
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.7/install-project-context-v0.1.7
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.1.7/install-project-context-v0.1.7.sha256
-3. Verify the installer with `sha256sum -c install-project-context-v0.1.7.sha256`
-   or `shasum -a 256 -c install-project-context-v0.1.7.sha256`. Stop if it fails.
+2. Download these assets for tag v0.2.0 into a private temporary directory:
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.2.0/install-project-context-v0.2.0
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.2.0/install-project-context-v0.2.0.sha256
+3. Verify the installer with `sha256sum -c install-project-context-v0.2.0.sha256`
+   or `shasum -a 256 -c install-project-context-v0.2.0.sha256`. Stop if it fails.
 4. If `gh` already exists, run
-   `gh attestation verify install-project-context-v0.1.7 --repo k2nr/project-context-skill`.
+   `gh attestation verify install-project-context-v0.2.0 --repo k2nr/project-context-skill`.
    Stop if it fails. Do not install `gh`, Python packages, Cargo, shellcheck, or
    another tool solely for installation.
 5. Make the verified installer executable. Run it first with
@@ -60,7 +60,7 @@ Installation requirements:
 Example installer arguments after repository inspection:
 
 ```sh
-./install-project-context-v0.1.7 \
+./install-project-context-v0.2.0 \
   --format json \
   --project-id example-project \
   --description 'Concise project purpose.' \

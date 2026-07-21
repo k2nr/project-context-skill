@@ -11,9 +11,9 @@ trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 
 first="${test_root}/first"
 second="${test_root}/second"
-"${repository_root}/bin/package-installer" 0.1.7 "$first" >/dev/null
-"${repository_root}/bin/package-installer" 0.1.7 "$second" >/dev/null
-asset=install-project-context-v0.1.7
+"${repository_root}/bin/package-installer" 0.2.0 "$first" >/dev/null
+"${repository_root}/bin/package-installer" 0.2.0 "$second" >/dev/null
+asset=install-project-context-v0.2.0
 cmp "${first}/${asset}" "${second}/${asset}"
 cmp "${first}/${asset}.sha256" "${second}/${asset}.sha256"
 test -x "${first}/${asset}"
