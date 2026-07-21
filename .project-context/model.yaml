@@ -1,36 +1,431 @@
-schema_version: 1
-project:
-  id: project-context-skill
-  description: Repository-local durable project intent and history for AI coding agents.
-principles: []
 architecture:
-  - id: verified-installer-boundary
-    statement: The standalone installer is a checksummed and attested release asset that verifies the skill package before repository writes and delegates canonical model mutation to the CLI.
-    related_events:
-      - D-0001
-  - id: separate-history-reconstruction
-    statement: Repository history reconstruction is provided by a separately invoked local skill that inventories only approved Git, repository, and metadata-linked Codex or Claude Code sources.
-    related_events:
-      - D-0002
+- event_relations:
+  - event: D-0012
+    kind: implementation
+  - event: D-0007
+    kind: origin
+  evidence:
+  - ref: file:README.md
+    role: implementation
+  id: repository-installed-skills
+  statement: Target repositories contain an automatically loaded project-context skill, an explicitly invoked reconstruct-project-context companion, a managed AGENTS block, and a .project-context store.
+- event_relations:
+  - event: D-0002
+    kind: origin
+  evidence:
+  - ref: file:cli/src/main.rs
+    role: implementation
+  - ref: file:project-context/bin/project-context
+    role: implementation
+  id: rust-cli-launcher
+  statement: A Rust CLI owns canonical validation, retrieval, mutation, migration, and atomic reconstruction; a project-local launcher fetches verified prebuilt release binaries for supported targets.
+- event_relations:
+  - event: D-0017
+    kind: origin
+  evidence:
+  - ref: file:project-context/assets/init/model.schema.json
+    role: implementation
+  - ref: file:project-context/assets/init/event.schema.json
+    role: implementation
+  id: schema-v2-store
+  statement: New stores use schema v2 structured evidence, exact optional event timestamps, typed relations, model provenance, and structured extensible operations; schema v1 remains readable and atomically migratable.
+- event_relations:
+  - event: D-0005
+    kind: implementation
+  evidence:
+  - ref: file:cli/src/store.rs
+    role: implementation
+  id: transactional-canonical-store
+  statement: Canonical initialization, migration, mutation, and reconstruction use locking, validation, typed transactions, crash recovery, atomic replacement, and base-state conflict detection.
+- event_relations:
+  - event: D-0008
+    kind: origin
+  - event: D-0015
+    kind: implementation
+  evidence:
+  - ref: file:bin/install-project-context
+    role: implementation
+  - ref: file:project-context/bin/update-project-context
+    role: implementation
+  id: verified-distribution
+  statement: Standalone installer and updater artifacts verify checksums, available attestations, archive shape, managed-file identity, and rollback boundaries before publishing writes.
+- event_relations:
+  - event: D-0012
+    kind: origin
+  - event: D-0010
+    kind: constraint
+  evidence:
+  - ref: file:reconstruct-project-context/scripts/inventory_local_history.py
+    role: implementation
+  id: frozen-local-inventory
+  statement: Reconstruction freezes approved Git and repository-associated Codex or Claude sources into a private inventory, verifies record and decision coverage, then applies one integrated candidate set.
+- evidence:
+  - observed_at: 2026-07-17T06:25:18.314Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#810
+    role: choice
+  - observed_at: 2026-07-19T07:50:33.668Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#2369
+    role: choice
+  id: reconstructed-project-local-install
+  statement: Install Project Context as repository-local skills under .agents/skills, with the primary skill automatic and reconstruction a separately invoked companion.
+- evidence:
+  - observed_at: 2026-07-17T05:48:56.811Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#385
+    role: choice
+  - observed_at: 2026-07-18T03:07:37.885Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#2869
+    role: choice
+  id: reconstructed-release-delivery
+  statement: Deliver prebuilt platform binaries and skill archives through verified GitHub Releases from k2nr/project-context-skill.
+- evidence:
+  - observed_at: 2026-07-17T05:59:12.241Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#521
+    role: choice
+  id: reconstructed-cli-surface
+  statement: Use the project-local launcher as the stable interface for initialization, validation, retrieval, event mutation, installation diagnosis, reconstruction checking/application, and updates.
+- event_relations:
+  - event: D-0022
+    kind: rationale
+  evidence:
+  - ref: commit:6eae90d2425211cf6ada25de3dbfa253762a8fd1
+    role: implementation
+  id: reconstructed-store-layout
+  statement: Store canonical intent in .project-context with schema-versioned model.yaml and append-oriented events.jsonl plus repository schema copies.
+- event_relations:
+  - event: D-0030
+    kind: rationale
+  evidence:
+  - ref: commit:59f896b0bc7ec9a39e5498787fbf12815a6dfa81
+    role: implementation
+  id: reconstructed-reconstruction-pipeline
+  statement: Reconstruct through a frozen inventory, complete coverage audit, independent candidates, a side-effect-free check, and transactional apply against opaque base snapshots.
+- evidence:
+  - observed_at: 2026-07-18T13:04:52.932Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#151
+    role: choice
+  - observed_at: 2026-07-18T16:51:55.431Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#2528
+    role: choice
+  - observed_at: 2026-07-19T06:34:47.503Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#3375
+    role: choice
+  id: reconstructed-reconstruction-mode
+  statement: Package reconstruction as a separate repository-local, local-evidence-only companion that applies qualified results automatically after its gates pass.
+- evidence:
+  - ref: commit:e5e0eff76a18c86996267119238de428453f8c65
+    role: implementation
+  id: reconstructed-dev-environment
+  statement: Use Devbox as the one-command reproducible development and validation environment, including ShellCheck and PyYAML.
 behaviors:
-  - id: safe-installation
-    statement: Installation supports preflight and dry-run reports, refuses differing local skill files or malformed managed markers, preserves existing history, and cleans private temporary state on every exit.
-    related_events:
-      - D-0001
-  - id: evidence-constrained-reconstruction
-    statement: After the source-scope gate, reconstruction automatically applies only evidence-qualified, non-conflicting model additions and reusable decision or attempt events through a base-state checked transaction.
-    related_events:
-      - D-0002
-  - id: chronological-event-timeline
-    statement: Store canonical events in ascending date order while preserving established evidence order among events with the same date.
-constraints: []
+- event_relations:
+  - event: D-0004
+    kind: origin
+  evidence:
+  - ref: file:project-context/SKILL.md
+    role: implementation
+  id: automatic-context-retrieval
+  statement: For non-trivial repository work, retrieve relevant current intent and connected decision or attempt history without waiting for explicit invocation.
+- event_relations:
+  - event: D-0016
+    kind: origin
+  evidence:
+  - ref: file:cli/src/store.rs
+    role: implementation
+  id: timeline-event-log
+  statement: Keep event JSONL in chronological order; prefer explicit occurred_at and otherwise preserve stable same-date evidence order.
+- event_relations:
+  - event: D-0009
+    kind: origin
+  - event: D-0012
+    kind: implementation
+  evidence:
+  - ref: file:reconstruct-project-context/SKILL.md
+    role: implementation
+  id: scope-gated-reconstruction
+  statement: Ask one source-scope question before substantive reconstruction when the user has not already selected sources, then automatically apply qualified candidates after both coverage gates pass.
+- event_relations:
+  - event: D-0015
+    kind: origin
+  evidence:
+  - ref: file:project-context/SKILL.md
+    role: implementation
+  id: explicit-safe-update
+  statement: The project-context update workflow performs a verified dry run before applying and stops on local managed-file drift.
+- event_relations:
+  - event: D-0005
+    kind: implementation
+  evidence:
+  - ref: file:cli/src/context.rs
+    role: implementation
+  id: connected-context-packets
+  statement: Context retrieval preserves model section shapes, scores file and Git evidence, and returns supersession components as indivisible historical units within a strict output budget.
+- event_relations:
+  - event: D-0023
+    kind: rationale
+  evidence:
+  - observed_at: 2026-07-17T07:02:30.320Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#1137
+    role: choice
+  - observed_at: 2026-07-17T07:04:31.959Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#1153
+    role: choice
+  - observed_at: 2026-07-18T12:25:59.677Z
+    ref: conversation:codex:019f7530-9694-7ec3-99c4-0c8052dd2478#42
+    role: choice
+  id: reconstructed-install-init
+  statement: Installation manages both local skills and the marked AGENTS block, initializes the canonical store, and verifies readiness without replacing divergent local files.
+- evidence:
+  - observed_at: 2026-07-17T07:06:46.448Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#1180
+    role: choice
+  id: reconstructed-automatic-context
+  statement: Use Project Context automatically for non-trivial repository work; invoke reconstruction only when historical recovery is explicitly requested.
+- evidence:
+  - observed_at: 2026-07-18T12:57:45.048Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#68
+    role: choice
+  - observed_at: 2026-07-18T16:51:55.429Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#2467
+    role: choice
+  - observed_at: 2026-07-19T06:34:47.501Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#3314
+    role: choice
+  id: reconstructed-scope-gate
+  statement: When reconstruction sources are unspecified, inspect metadata only and ask one combined scope question before reading history content.
+- evidence:
+  - observed_at: 2026-07-19T08:07:10.832Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#330
+    role: choice
+  - observed_at: 2026-07-19T14:53:54.107Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#4365
+    role: choice
+  - observed_at: 2026-07-21T08:00:30.117Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#5552
+    role: choice
+  - observed_at: 2026-07-21T08:01:07.683Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#6577
+    role: choice
+  - observed_at: 2026-07-21T08:14:38.432Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#7718
+    role: choice
+  id: reconstructed-complete-user-audit
+  statement: Audit every direct-user decision signal separately so short approvals, corrections, and quoted proposals cannot be hidden by ordinary record coverage.
+- evidence:
+  - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
+    role: implementation
+  id: reconstructed-qualified-auto-apply
+  statement: Automatically apply only evidence-qualified reconstruction candidates after coverage, candidate, schema, reference, and base-conflict gates pass.
+- event_relations:
+  - event: D-0028
+    kind: rationale
+  evidence:
+  - observed_at: 2026-07-19T11:55:22.913Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#849
+    role: choice
+  - observed_at: 2026-07-19T14:53:54.109Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#4594
+    role: choice
+  - observed_at: 2026-07-21T08:00:30.122Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#5781
+    role: choice
+  - observed_at: 2026-07-21T08:01:07.689Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#6806
+    role: choice
+  - observed_at: 2026-07-21T08:14:38.436Z
+    ref: conversation:codex:019f7955-8f1a-74e3-878e-1f752a65f2a0#7947
+    role: choice
+  id: reconstructed-timeline-semantics
+  statement: Keep events in chronological order, using occurred_at only for explicit decision choice or attempt outcome time and preserving unknown-time barriers.
+- evidence:
+  - observed_at: 2026-07-19T11:59:04.274Z
+    ref: conversation:codex:019f7a3d-2a0d-7163-aa37-3c9c5a4c335f#8
+    role: choice
+  id: reconstructed-safe-update
+  statement: The skill-owned update workflow replaces only a pristine verified installation with a verified latest release and rolls back all installer-owned targets on failure.
+constraints:
+- event_relations:
+  - event: D-0010
+    kind: origin
+  evidence:
+  - ref: file:reconstruct-project-context/references/sources.md
+    role: implementation
+  id: local-reconstruction-only
+  statement: Reconstruction may use approved local repository data and repository-associated local Codex or Claude sessions, but never external services or unrelated conversations.
+- event_relations:
+  - event: D-0014
+    kind: origin
+  evidence:
+  - ref: file:reconstruct-project-context/references/qualification.md
+    role: implementation
+  id: canonical-blindness
+  statement: Current and historical .project-context/model.yaml and events.jsonl are never reconstruction evidence; base snapshots are opaque preservation and concurrency inputs only.
+- event_relations:
+  - event: D-0002
+    kind: constraint
+  evidence:
+  - ref: file:README.md
+    role: implementation
+  id: supported-platforms
+  statement: Published prebuilt binaries support macOS 11 or newer and GNU Linux with glibc 2.31 or newer on x86_64 and arm64; musl, Windows, and other targets are unsupported.
+- event_relations:
+  - event: D-0008
+    kind: constraint
+  - event: D-0015
+    kind: constraint
+  evidence:
+  - ref: file:README.md
+    role: implementation
+  id: managed-drift-is-conflict
+  statement: Install and update never overwrite differing installed skills or malformed or locally modified managed AGENTS content; conflict exits require human direction.
+- event_relations:
+  - event: D-0011
+    kind: origin
+  evidence:
+  - ref: file:reconstruct-project-context/SKILL.md
+    role: implementation
+  id: release-work-is-separate
+  statement: Feature implementation does not implicitly choose a next version, create tags, publish releases, or add unspecified automatic upgrades.
+- event_relations:
+  - event: D-0006
+    kind: origin
+  evidence:
+  - ref: file:project-context/SKILL.md
+    role: implementation
+  id: project-commit-rules-first
+  statement: Project-specific commit rules take precedence; Project Context commit guidance applies only where compatible.
+- event_relations:
+  - event: D-0012
+    kind: implementation
+  evidence:
+  - ref: file:bin/package-skill
+    role: implementation
+  id: two-skill-package-boundary
+  statement: The distributable skill package contains exactly project-context and reconstruct-project-context as top-level skill directories, with development sources and artifacts excluded.
+- evidence:
+  - observed_at: 2026-07-17T05:16:20.256Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#8
+    role: choice
+  id: reconstructed-public-english
+  statement: Keep publicly distributed skill files, documentation, code comments, and release-facing content in English.
+- evidence:
+  - observed_at: 2026-07-17T06:51:13.828Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#1077
+    role: choice
+  id: reconstructed-no-docs-directory
+  statement: Do not add a standalone docs directory; keep necessary public guidance with the skills and README.
+- evidence:
+  - observed_at: 2026-07-17T06:34:27.972Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#928
+    role: choice
+  id: reconstructed-bin-layout
+  statement: Use bin rather than scripts for executable entrypoints and keep LICENSE files at the correct package roots.
+- evidence:
+  - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
+    role: implementation
+  id: reconstructed-no-external-reconstruction
+  statement: Reconstruction must not access external services or the network, and ignored files are never evidence.
+- event_relations:
+  - event: D-0027
+    kind: rationale
+  evidence:
+  - ref: commit:0a2ac1452ec9c7223aac566428d13233a6cedfdb
+    role: implementation
+  id: reconstructed-canonical-blindness
+  statement: Never use current or historical .project-context model.yaml or events.jsonl as reconstruction evidence; treat bases only as opaque preservation and conflict inputs.
+- evidence:
+  - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
+    role: implementation
+  id: reconstructed-version-separation
+  statement: Do not select a future version, publish a release, or upgrade a divergent installation as a side effect of unrelated feature work.
+- event_relations:
+  - event: D-0021
+    kind: rationale
+  evidence:
+  - observed_at: 2026-07-17T05:59:12.241Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#521
+    role: context
+  id: reconstructed-project-rules-first
+  statement: Apply Project Context commit guidance only where it does not conflict with repository-specific commit rules.
+extensions: {}
 operations:
   build:
-    - devbox run build
-  test:
-    - devbox run test
-  lint:
-    - devbox run lint
+  - command: devbox run build
+    description: Build the locked Rust CLI through the reproducible development environment.
   format:
-    - devbox run format
-extensions: {}
+  - command: devbox run format
+    description: Check Rust formatting.
+  lint:
+  - command: devbox run lint
+    description: Run Clippy, ShellCheck, shell syntax checks, and both skill validators.
+  test:
+  - command: devbox run test
+    description: Run Rust and repository integration tests.
+  verify:
+  - command: devbox run verify
+    description: Run the complete build, format, lint, and test gate.
+principles:
+- event_relations:
+  - event: D-0003
+    kind: origin
+  evidence:
+  - ref: file:README.md
+    role: implementation
+  id: ai-agent-interface
+  statement: Optimize canonical context and workflows for AI consumption in solo projects where the human uses an AI agent as the codebase interface.
+- evidence:
+  - ref: file:project-context/SKILL.md
+    role: implementation
+  id: durable-only
+  statement: Persist only intent, rationale, or costly findings that cannot be recovered reliably from current code, tests, schemas, and Git.
+- event_relations:
+  - event: D-0014
+    kind: rationale
+  evidence:
+  - ref: file:reconstruct-project-context/SKILL.md
+    role: implementation
+  id: evidence-before-conclusions
+  statement: Reconstruction conclusions must be evidence-qualified, cover every selected source and direct-user signal, and never use canonical model/events as truth.
+- event_relations:
+  - event: D-0005
+    kind: origin
+  evidence:
+  - ref: file:README.md
+    role: implementation
+  id: preserve-local-state
+  statement: Install, update, migration, and reconstruction operations fail closed on conflicts and preserve unrelated local state.
+- evidence:
+  - observed_at: 2026-07-17T06:58:43.277Z
+    ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#1121
+    role: choice
+  id: reconstructed-agent-interface
+  statement: Optimize durable context for AI-agent retrieval in solo projects where the human works through the agent rather than reading specifications.
+- evidence:
+  - ref: commit:0a2ac1452ec9c7223aac566428d13233a6cedfdb
+    role: implementation
+  id: reconstructed-evidence-discipline
+  statement: Persist only durable intent supported by frozen local evidence, keeping inferred rationale, transcripts, secrets, and routine failures out of canonical context.
+- evidence:
+  - observed_at: 2026-07-18T16:44:19.137Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#260
+    role: choice
+  - observed_at: 2026-07-18T16:45:33.819Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#290
+    role: choice
+  - observed_at: 2026-07-18T16:51:55.433Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#2621
+    role: choice
+  - observed_at: 2026-07-18T16:51:55.434Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#2646
+    role: choice
+  - observed_at: 2026-07-19T06:34:47.504Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#3468
+    role: choice
+  - observed_at: 2026-07-19T06:34:47.505Z
+    ref: conversation:codex:019f7545-e98f-7151-9b85-f281d9263229#3493
+    role: choice
+  id: reconstructed-local-privacy
+  statement: Keep history reconstruction local and limit conversation evidence to sessions whose metadata associates them with the repository or a shared-Git worktree.
+project:
+  description: A repository-installed skill and CLI that preserve, retrieve, reconstruct, and safely evolve durable project intent for AI-agent-driven software projects.
+  id: project-context-skill
+schema_version: 2
