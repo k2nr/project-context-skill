@@ -118,7 +118,9 @@ jobs:
           ref: ${{ needs.resolve.outputs.release_sha }}
           persist-credentials: false
       - name: Verify checked-out release commit
-        run: test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+          test "$(git rev-parse HEAD)" = "${RELEASE_SHA}"
       - name: Build release binary
         run: |
           rustup target add "${{ matrix.target }}"
