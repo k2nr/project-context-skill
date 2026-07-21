@@ -1344,19 +1344,35 @@ fn validate_candidate_schemas(
     let model_validator = compile_schema("embedded model schema", MODEL_SCHEMA, &mut report);
     errors.extend(report.errors);
 
+    let mut occupied_ids: BTreeSet<String> = existing_types.keys().cloned().collect();
+    let mut candidate_placeholders = BTreeMap::new();
+    let mut next_placeholder = 1_u64;
+    for (candidate, event_type) in candidate_types {
+        let prefix = match event_type.as_str() {
+            "decision" => "D",
+            "attempt" => "A",
+            _ => continue,
+        };
+        loop {
+            let placeholder = format!("{prefix}-{next_placeholder}");
+            next_placeholder += 1;
+            if occupied_ids.insert(placeholder.clone()) {
+                candidate_placeholders.insert(candidate.clone(), placeholder);
+                break;
+            }
+        }
+    }
+
     let replacement = |reference: &str, errors: &mut Vec<String>| -> Option<String> {
-        let event_type = candidate_types
-            .get(reference)
-            .or_else(|| existing_types.get(reference));
-        match event_type.map(String::as_str) {
-            Some("decision") => Some("D-1".to_owned()),
-            Some("attempt") => Some("A-1".to_owned()),
+        match candidate_types.get(reference).map(String::as_str) {
+            Some("decision" | "attempt") => candidate_placeholders.get(reference).cloned(),
             Some(other) => {
                 errors.push(format!(
                     "event reference '{reference}' has unknown type '{other}'"
                 ));
                 None
             }
+            None if existing_types.contains_key(reference) => Some(reference.to_owned()),
             None if reference.starts_with("candidate:") => {
                 errors.push(format!("dangling candidate event reference '{reference}'"));
                 None
@@ -3546,6 +3562,32 @@ mod tests {
             ("candidate:second".to_owned(), "candidate:first".to_owned()),
         ]);
         assert!(resolve_reference_map(&remap).is_err());
+    }
+
+    #[test]
+    fn candidate_schema_validation_preserves_distinct_canonical_relations() {
+        let mut model = yaml_to_json(MODEL_TEMPLATE, "model template").expect("valid template");
+        model["constraints"] = json!([{
+            "id": "preserved-relations",
+            "statement": "Preserve distinct canonical event relations.",
+            "event_relations": [
+                {"event": "D-1", "kind": "related"},
+                {"event": "D-2", "kind": "related"},
+                {"event": "candidate:first", "kind": "related"},
+                {"event": "candidate:second", "kind": "related"}
+            ]
+        }]);
+        let existing_types = BTreeMap::from([
+            ("D-1".to_owned(), "decision".to_owned()),
+            ("D-2".to_owned(), "decision".to_owned()),
+        ]);
+        let candidate_types = BTreeMap::from([
+            ("candidate:first".to_owned(), "decision".to_owned()),
+            ("candidate:second".to_owned(), "decision".to_owned()),
+        ]);
+        let mut errors = Vec::new();
+        validate_candidate_schemas(&model, &[], &candidate_types, &existing_types, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
