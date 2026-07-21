@@ -282,65 +282,9 @@ jobs:
           tests/test-package.sh "release-assets/project-context-skill-${version}.tar.gz"
           tests/test-installer-package.sh
       - name: Attest release assets
-        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: release-assets/*
-      - name: Record recovery SLSA provenance
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          RECOVERY_GIT_REF: ${{ github.ref }}
-          RECOVERY_WORKFLOW_SHA: ${{ github.sha }}
-          RECOVERY_WORKFLOW_REF: ${{ github.workflow_ref }}
-        run: |
-          jq -n \
-            --arg repository "${GITHUB_REPOSITORY}" \
-            --arg release_tag "${RELEASE_TAG}" \
-            --arg release_tag_object_sha "${RELEASE_TAG_OBJECT_SHA}" \
-            --arg source_commit "${RELEASE_SHA}" \
-            --arg recovery_git_ref "${RECOVERY_GIT_REF}" \
-            --arg workflow_commit "${RECOVERY_WORKFLOW_SHA}" \
-            --arg workflow_ref "${RECOVERY_WORKFLOW_REF}" \
-            --arg server_url "${GITHUB_SERVER_URL}" \
-            --arg invocation_id "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
-            '{
-              buildDefinition: {
-                buildType: "https://actions.github.io/buildtypes/workflow/v1",
-                externalParameters: {
-                  workflow: {
-                    ref: $recovery_git_ref,
-                    repository: ($server_url + "/" + $repository),
-                    path: ".github/workflows/release.yml"
-                  },
-                  inputs: {release_tag: $release_tag}
-                },
-                internalParameters: {github: {event_name: "workflow_dispatch"}},
-                resolvedDependencies: [
-                  {
-                    uri: ("git+" + $server_url + "/" + $repository + "@" + $recovery_git_ref),
-                    digest: {gitCommit: $workflow_commit},
-                    annotations: {role: "buildConfiguration", workflow: $workflow_ref}
-                  },
-                  {
-                    uri: ("git+" + $server_url + "/" + $repository + "@refs/tags/" + $release_tag),
-                    digest: {gitCommit: $source_commit},
-                    annotations: {releaseTagObjectSha: $release_tag_object_sha, role: "source"}
-                  }
-                ]
-              },
-              runDetails: {
-                builder: {id: ($server_url + "/" + $workflow_ref)},
-                metadata: {invocationId: $invocation_id}
-              }
-            }' > recovery-slsa-provenance.json
-      - name: Attest recovery SLSA provenance
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
-        with:
-          subject-path: release-assets/*
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate-path: recovery-slsa-provenance.json
-          create-storage-record: false
       - name: Record release source identity
         env:
           RECOVERY_WORKFLOW_SHA: ${{ github.sha }}
