@@ -208,6 +208,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
@@ -339,6 +340,7 @@ jobs:
           subject-path: release-assets/*
           predicate-type: https://slsa.dev/provenance/v1
           predicate-path: recovery-slsa-provenance.json
+          create-storage-record: false
       - name: Record release source identity
         env:
           RECOVERY_WORKFLOW_SHA: ${{ github.sha }}
@@ -359,6 +361,7 @@ jobs:
           subject-path: release-assets/*
           predicate-type: https://github.com/k2nr/project-context-skill/attestations/release-source/v1
           predicate-path: release-source-predicate.json
+          create-storage-record: false
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
