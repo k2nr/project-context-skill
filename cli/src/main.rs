@@ -6,7 +6,8 @@ mod store;
 use clap::{Parser, Subcommand, ValueEnum};
 use output::{
     OutputFormat, render_configure, render_conflict, render_context, render_doctor, render_event,
-    render_init, render_migrate, render_reconstruction, render_validation,
+    render_init, render_migrate, render_reconstruction, render_reconstruction_check,
+    render_validation,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -126,6 +127,21 @@ enum Command {
         model: PathBuf,
         #[arg(long)]
         events: PathBuf,
+        #[arg(long)]
+        inventory: PathBuf,
+    },
+    /// Validate a reconstruction without changing the canonical store.
+    CheckReconstruction {
+        #[arg(long)]
+        base_model: PathBuf,
+        #[arg(long)]
+        base_events: PathBuf,
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        events: PathBuf,
+        #[arg(long)]
+        inventory: PathBuf,
     },
     /// Validate the nearest project-context store.
     Validate {
@@ -338,6 +354,7 @@ fn run(cli: &Cli) -> Result<String, AppError> {
             base_events,
             model,
             events,
+            inventory,
         } => {
             let root = nearest_root()?;
             let report = store::apply_reconstruction(
@@ -347,9 +364,30 @@ fn run(cli: &Cli) -> Result<String, AppError> {
                     base_events: base_events.clone(),
                     model: model.clone(),
                     events: events.clone(),
+                    inventory: inventory.clone(),
                 },
             )?;
             Ok(render_reconstruction(&report, cli.format))
+        }
+        Command::CheckReconstruction {
+            base_model,
+            base_events,
+            model,
+            events,
+            inventory,
+        } => {
+            let root = nearest_root()?;
+            let report = store::check_reconstruction(
+                &root,
+                store::ReconstructionInput {
+                    base_model: base_model.clone(),
+                    base_events: base_events.clone(),
+                    model: model.clone(),
+                    events: events.clone(),
+                    inventory: inventory.clone(),
+                },
+            )?;
+            Ok(render_reconstruction_check(&report, cli.format))
         }
         Command::Validate { strict } => {
             let root = nearest_root()?;

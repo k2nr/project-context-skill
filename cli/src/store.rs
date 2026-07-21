@@ -120,10 +120,20 @@ pub struct ReconstructionInput {
     pub base_events: PathBuf,
     pub model: PathBuf,
     pub events: PathBuf,
+    pub inventory: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ReconstructionReport {
+    pub model_changed: bool,
+    pub events_added: usize,
+    pub duplicates_skipped: usize,
+    pub no_op: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconstructionCheckReport {
+    pub valid: bool,
     pub model_changed: bool,
     pub events_added: usize,
     pub duplicates_skipped: usize,
@@ -846,13 +856,46 @@ pub fn apply_reconstruction(
     root: &Path,
     input: ReconstructionInput,
 ) -> Result<ReconstructionReport, StoreError> {
+    prepare_reconstruction(root, input, true)
+}
+
+pub fn check_reconstruction(
+    root: &Path,
+    input: ReconstructionInput,
+) -> Result<ReconstructionCheckReport, StoreError> {
+    let report = prepare_reconstruction(root, input, false)?;
+    Ok(ReconstructionCheckReport {
+        valid: true,
+        model_changed: report.model_changed,
+        events_added: report.events_added,
+        duplicates_skipped: report.duplicates_skipped,
+        no_op: report.no_op,
+    })
+}
+
+fn prepare_reconstruction(
+    root: &Path,
+    input: ReconstructionInput,
+    apply: bool,
+) -> Result<ReconstructionReport, StoreError> {
     let base_model = read_input_file(&input.base_model, "base model")?;
     let base_events = read_input_file(&input.base_events, "base events")?;
     let proposed_model = read_input_file(&input.model, "proposed model")?;
     let proposed_new_events = read_input_file(&input.events, "proposed events")?;
+    let decision_coverage = read_input_file(
+        &input.inventory.join("decision-coverage.jsonl"),
+        "decision coverage",
+    )?;
 
-    let lock = open_lock(root, true).map_err(StoreError::Environment)?;
-    recover_transaction(root).map_err(StoreError::Environment)?;
+    let lock = open_lock(root, apply).map_err(StoreError::Environment)?;
+    if apply {
+        recover_transaction(root).map_err(StoreError::Environment)?;
+    } else if root.join(TRANSACTION_DIRECTORY).exists() {
+        let _ = lock.unlock();
+        return Err(StoreError::Environment(
+            "cannot check reconstruction while a recovery transaction is pending".to_owned(),
+        ));
+    }
     let documents = read_documents(root)?;
     if documents.model.as_bytes() != base_model.as_bytes()
         || documents.events.as_bytes() != base_events.as_bytes()
@@ -879,6 +922,14 @@ pub fn apply_reconstruction(
     let mut merge_errors = validate_model_merge(&base_model_value, &proposed_model_value);
     let mut candidates =
         parse_event_lines(&proposed_new_events, "proposed events", &mut merge_errors);
+    validate_reconstruction_audit(
+        &input.inventory,
+        &decision_coverage,
+        &proposed_model_value,
+        &candidates,
+        &current_data,
+        &mut merge_errors,
+    );
     let mut candidate_ids = BTreeSet::new();
     for event in &candidates {
         if let Some(id) = event.get("id").and_then(Value::as_str) {
@@ -891,7 +942,7 @@ pub fn apply_reconstruction(
             }
         }
     }
-    candidates.sort_by_key(|event| event_date(event).to_owned());
+    sort_event_values_in_timeline_order(&mut candidates);
 
     let mut existing_by_key = BTreeMap::new();
     for event in &current_data.events {
@@ -942,7 +993,7 @@ pub fn apply_reconstruction(
     }
 
     // Stable ordering preserves evidence-derived order when only day precision exists.
-    retained.sort_by_key(event_timeline_key);
+    sort_event_values_in_timeline_order(&mut retained);
     let mut allocated_events = current_data.events.clone();
     for event in &mut retained {
         let Some(candidate_id) = event.get("id").and_then(Value::as_str).map(str::to_owned) else {
@@ -1001,7 +1052,7 @@ pub fn apply_reconstruction(
     let model_changed = proposed_model.as_bytes() != documents.model.as_bytes();
     let events_changed = combined_events.as_bytes() != documents.events.as_bytes();
     let no_op = !model_changed && !events_changed;
-    if !no_op {
+    if apply && !no_op {
         transactional_replace(
             root,
             TransactionKind::Reconstruction,
@@ -1018,12 +1069,732 @@ pub fn apply_reconstruction(
     })
 }
 
+fn validate_reconstruction_audit(
+    inventory: &Path,
+    decision_coverage: &str,
+    proposed_model: &Value,
+    candidates: &[Value],
+    current_data: &RepositoryData,
+    errors: &mut Vec<String>,
+) {
+    let records = parse_event_lines(decision_coverage, "decision coverage", errors);
+    let statuses: BTreeMap<String, String> = records
+        .iter()
+        .filter_map(|record| {
+            Some((
+                record.get("source")?.as_str()?.to_owned(),
+                record.get("status")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    if statuses.len() != records.len() {
+        errors.push("decision coverage contains missing or duplicate sources/statuses".to_owned());
+    }
+    let analyzed_sources = validate_resolved_inventory_coverage(inventory, errors);
+    let decision_manifest =
+        inventory_manifest_sources(inventory, "decision-coverage.jsonl", errors);
+    if statuses.keys().cloned().collect::<BTreeSet<_>>() != decision_manifest {
+        errors.push("decision coverage sources do not match the frozen manifest".to_owned());
+    }
+    let conversation_manifest =
+        inventory_manifest_sources(inventory, "conversation-coverage.jsonl", errors);
+    if !decision_manifest.is_subset(&conversation_manifest) {
+        errors.push("decision coverage contains a non-conversation source".to_owned());
+    }
+
+    let candidate_types: BTreeMap<String, String> = candidates
+        .iter()
+        .filter_map(|event| {
+            Some((
+                event.get("id")?.as_str()?.to_owned(),
+                event.get("type")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    let candidates_by_id: BTreeMap<String, &Value> = candidates
+        .iter()
+        .filter_map(|event| Some((event.get("id")?.as_str()?.to_owned(), event)))
+        .collect();
+    let existing_types: BTreeMap<String, String> = current_data
+        .events
+        .iter()
+        .filter_map(|event| {
+            Some((
+                event.get("id")?.as_str()?.to_owned(),
+                event.get("type")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+
+    validate_candidate_schemas(
+        proposed_model,
+        candidates,
+        &candidate_types,
+        &existing_types,
+        errors,
+    );
+
+    let allowed_conversations = analyzed_sources
+        .get("conversation-coverage.jsonl")
+        .cloned()
+        .unwrap_or_default();
+    let analyzed_commits = analyzed_sources
+        .get("commit-coverage.jsonl")
+        .cloned()
+        .unwrap_or_default();
+    let mut allowed_commits = inventory_commit_ids(inventory, errors);
+    allowed_commits.retain(|commit| {
+        analyzed_commits
+            .iter()
+            .any(|source| source.rsplit(':').next() == Some(commit.as_str()))
+    });
+    let analyzed_untracked = analyzed_sources
+        .get("untracked-coverage.jsonl")
+        .cloned()
+        .unwrap_or_default();
+    let allowed_files = inventory_file_paths(inventory, &analyzed_untracked, errors);
+
+    let mut used_conversations = BTreeMap::new();
+    for event in candidates {
+        let id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        validate_reconstruction_evidence(
+            &format!("candidate event '{id}'"),
+            event.get("evidence").and_then(Value::as_array),
+            &allowed_conversations,
+            &allowed_commits,
+            &allowed_files,
+            &mut used_conversations,
+            errors,
+        );
+        validate_occurred_at_semantics(event, errors);
+    }
+    for section in ["principles", "architecture", "behaviors", "constraints"] {
+        for entry in proposed_model
+            .get(section)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if current_data
+                .model
+                .get(section)
+                .and_then(Value::as_array)
+                .is_some_and(|base_entries| base_entries.contains(entry))
+            {
+                continue;
+            }
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            validate_reconstruction_evidence(
+                &format!("model entry '{section}:{id}'"),
+                entry.get("evidence").and_then(Value::as_array),
+                &allowed_conversations,
+                &allowed_commits,
+                &allowed_files,
+                &mut used_conversations,
+                errors,
+            );
+        }
+    }
+
+    for record in &records {
+        let source = record.get("source").and_then(Value::as_str).unwrap_or("");
+        let status = record.get("status").and_then(Value::as_str).unwrap_or("");
+        if matches!(status, "decision" | "model")
+            && record
+                .get("topic")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("{status} signal '{source}' has no topic"));
+        }
+        if status == "decision"
+            && record
+                .get("rationale")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("decision signal '{source}' has no rationale"));
+        }
+        if matches!(status, "excluded" | "unavailable")
+            && record
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("{status} signal '{source}' has no reason"));
+        }
+        match status {
+            "decision" => {
+                let candidate = record
+                    .get("candidate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let Some(event) = candidates_by_id.get(candidate) else {
+                    errors.push(format!(
+                        "decision signal '{source}' references missing candidate '{candidate}'"
+                    ));
+                    continue;
+                };
+                if event.get("type").and_then(Value::as_str) != Some("decision") {
+                    errors.push(format!(
+                        "decision signal '{source}' candidate '{candidate}' is not a decision"
+                    ));
+                }
+                if !has_evidence_ref(event, source) {
+                    errors.push(format!(
+                        "decision signal '{source}' is absent from candidate event evidence"
+                    ));
+                }
+                let expected = normalize_whitespace(
+                    record
+                        .get("rationale")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                let actual =
+                    normalize_whitespace(event.get("reason").and_then(Value::as_str).unwrap_or(""));
+                if expected != actual {
+                    errors.push(format!(
+                        "decision signal '{source}' rationale differs from '{candidate}'"
+                    ));
+                }
+            }
+            "model" => {
+                let mapping = record
+                    .get("candidate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let Some((section, id)) = valid_model_candidate(mapping) else {
+                    errors.push(format!(
+                        "model signal '{source}' requires candidate section:id"
+                    ));
+                    continue;
+                };
+                let entry = proposed_model
+                    .get(section)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id));
+                if entry.is_none() {
+                    errors.push(format!(
+                        "model signal '{source}' references missing model entry '{mapping}'"
+                    ));
+                } else if !entry.is_some_and(|entry| has_evidence_ref(entry, source)) {
+                    errors.push(format!(
+                        "model signal '{source}' is absent from '{mapping}' evidence"
+                    ));
+                }
+            }
+            "excluded" | "unavailable" => {
+                if used_conversations.contains_key(source) {
+                    errors.push(format!(
+                        "{status} conversation source '{source}' is used as reconstruction evidence"
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "decision coverage source '{source}' has unresolved status '{status}'"
+            )),
+        }
+    }
+}
+
+fn normalize_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn valid_model_candidate(value: &str) -> Option<(&str, &str)> {
+    let (section, id) = value.split_once(':')?;
+    let mut characters = id.chars();
+    let valid_id = id.len() <= 240
+        && characters
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        && characters
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character));
+    (["principles", "architecture", "behaviors", "constraints"].contains(&section) && valid_id)
+        .then_some((section, id))
+}
+
+fn has_evidence_ref(value: &Value, reference: &str) -> bool {
+    value
+        .get("evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| evidence_reference(item) == Some(reference))
+}
+
+fn validate_candidate_schemas(
+    model: &Value,
+    candidates: &[Value],
+    candidate_types: &BTreeMap<String, String>,
+    existing_types: &BTreeMap<String, String>,
+    errors: &mut Vec<String>,
+) {
+    let mut report = ValidationReport::default();
+    let event_validator = compile_schema("embedded event schema", EVENT_SCHEMA, &mut report);
+    let model_validator = compile_schema("embedded model schema", MODEL_SCHEMA, &mut report);
+    errors.extend(report.errors);
+
+    let replacement = |reference: &str, errors: &mut Vec<String>| -> Option<String> {
+        let event_type = candidate_types
+            .get(reference)
+            .or_else(|| existing_types.get(reference));
+        match event_type.map(String::as_str) {
+            Some("decision") => Some("D-1".to_owned()),
+            Some("attempt") => Some("A-1".to_owned()),
+            Some(other) => {
+                errors.push(format!(
+                    "event reference '{reference}' has unknown type '{other}'"
+                ));
+                None
+            }
+            None if reference.starts_with("candidate:") => {
+                errors.push(format!("dangling candidate event reference '{reference}'"));
+                None
+            }
+            None => Some(reference.to_owned()),
+        }
+    };
+
+    if let Some(validator) = event_validator {
+        for candidate in candidates {
+            let mut instance = candidate.clone();
+            let id = instance
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>")
+                .to_owned();
+            if let Some(resolved) = replacement(&id, errors) {
+                instance["id"] = Value::String(resolved);
+            }
+            if let Some(relations) = instance.get_mut("relations").and_then(Value::as_array_mut) {
+                for relation in relations {
+                    if let Some(reference) = relation.get("event").and_then(Value::as_str)
+                        && let Some(resolved) = replacement(reference, errors)
+                    {
+                        relation["event"] = Value::String(resolved);
+                    }
+                }
+            }
+            collect_schema_errors(
+                &format!("candidate event '{id}'"),
+                &validator,
+                &instance,
+                errors,
+            );
+        }
+    }
+
+    if let Some(validator) = model_validator {
+        let mut instance = model.clone();
+        for section in ["principles", "architecture", "behaviors", "constraints"] {
+            for entry in instance
+                .get_mut(section)
+                .and_then(Value::as_array_mut)
+                .into_iter()
+                .flatten()
+            {
+                for relation in entry
+                    .get_mut("event_relations")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(reference) = relation.get("event").and_then(Value::as_str)
+                        && let Some(resolved) = replacement(reference, errors)
+                    {
+                        relation["event"] = Value::String(resolved);
+                    }
+                }
+            }
+        }
+        collect_schema_errors("proposed model", &validator, &instance, errors);
+    }
+}
+
+fn inventory_manifest_sources(
+    inventory: &Path,
+    name: &str,
+    errors: &mut Vec<String>,
+) -> BTreeSet<String> {
+    let path = inventory.join("coverage-sources.json");
+    let Ok(content) = fs::read_to_string(&path) else {
+        errors.push(format!("cannot read frozen inventory {}", path.display()));
+        return BTreeSet::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        errors.push(format!(
+            "frozen inventory {} is not valid JSON",
+            path.display()
+        ));
+        return BTreeSet::new();
+    };
+    let Some(sources) = value
+        .get("sources")
+        .and_then(|sources| sources.get(name))
+        .and_then(Value::as_array)
+    else {
+        errors.push(format!(
+            "frozen inventory has no source manifest for {name}"
+        ));
+        return BTreeSet::new();
+    };
+    let result: BTreeSet<String> = sources
+        .iter()
+        .filter_map(|source| source.as_str().map(str::to_owned))
+        .collect();
+    if result.len() != sources.len() {
+        errors.push(format!(
+            "frozen source manifest for {name} has invalid or duplicate entries"
+        ));
+    }
+    result
+}
+
+fn validate_resolved_inventory_coverage(
+    inventory: &Path,
+    errors: &mut Vec<String>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let summary_path = inventory.join("summary.json");
+    let summary = fs::read_to_string(&summary_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok());
+    let Some(summary) = summary else {
+        errors.push(format!(
+            "frozen inventory {} is invalid or missing",
+            summary_path.display()
+        ));
+        return BTreeMap::new();
+    };
+    let include_untracked_value = summary
+        .pointer("/selected/non_ignored_untracked")
+        .and_then(Value::as_bool);
+    if include_untracked_value.is_none() {
+        errors.push(
+            "frozen inventory summary has no boolean non_ignored_untracked selection".to_owned(),
+        );
+    }
+    let include_untracked = include_untracked_value.unwrap_or(false);
+    let mut specifications = vec![
+        (
+            "commit-coverage.jsonl",
+            summary.pointer("/counts/commits").and_then(Value::as_u64),
+        ),
+        (
+            "conversation-coverage.jsonl",
+            summary
+                .pointer("/counts/conversation_records")
+                .and_then(Value::as_u64),
+        ),
+    ];
+    if include_untracked {
+        specifications.push((
+            "untracked-coverage.jsonl",
+            summary
+                .pointer("/counts/untracked_coverage")
+                .and_then(Value::as_u64),
+        ));
+    }
+    let decision_count = summary
+        .pointer("/counts/decision_signals")
+        .and_then(Value::as_u64);
+    if specifications.iter().any(|(_, count)| count.is_none()) || decision_count.is_none() {
+        errors.push("frozen inventory summary has missing coverage counts".to_owned());
+    }
+
+    let manifest_path = inventory.join("coverage-sources.json");
+    let manifest = fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok());
+    let Some(manifest) = manifest else {
+        errors.push(format!(
+            "frozen inventory {} is invalid or missing",
+            manifest_path.display()
+        ));
+        return BTreeMap::new();
+    };
+    if manifest.get("version").and_then(Value::as_u64) != Some(1) {
+        errors.push("frozen source manifest has an unsupported version".to_owned());
+    }
+    let expected_names: BTreeSet<&str> = specifications
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(std::iter::once("decision-coverage.jsonl"))
+        .collect();
+    let actual_names: BTreeSet<&str> = manifest
+        .get("sources")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|sources| sources.keys().map(String::as_str))
+        .collect();
+    if actual_names != expected_names {
+        errors.push("coverage source manifest does not match selected inventories".to_owned());
+    }
+
+    let mut analyzed_by_file = BTreeMap::new();
+    for (name, expected_count) in specifications {
+        let path = inventory.join(name);
+        if !path.exists() {
+            errors.push(format!("frozen inventory is missing {name}"));
+            continue;
+        }
+        let manifest = inventory_manifest_sources(inventory, name, errors);
+        let Ok(content) = fs::read_to_string(&path) else {
+            errors.push(format!("cannot read frozen coverage {}", path.display()));
+            continue;
+        };
+        let mut sources = BTreeSet::new();
+        let mut analyzed = BTreeSet::new();
+        let mut record_count = 0_u64;
+        for (index, line) in content.lines().enumerate() {
+            record_count += 1;
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                errors.push(format!(
+                    "frozen coverage {}:{} is invalid JSON",
+                    path.display(),
+                    index + 1
+                ));
+                continue;
+            };
+            let source = record.get("source").and_then(Value::as_str);
+            let status = record.get("status").and_then(Value::as_str);
+            if !matches!(status, Some("analyzed" | "excluded" | "unavailable")) {
+                errors.push(format!(
+                    "frozen coverage {}:{} has unresolved status",
+                    path.display(),
+                    index + 1
+                ));
+            }
+            if matches!(status, Some("excluded" | "unavailable"))
+                && record
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "frozen coverage {}:{} has no exclusion reason",
+                    path.display(),
+                    index + 1
+                ));
+            }
+            if let Some(source) = source {
+                if !sources.insert(source.to_owned()) {
+                    errors.push(format!(
+                        "frozen coverage {name} duplicates source '{source}'"
+                    ));
+                }
+                if status == Some("analyzed") {
+                    analyzed.insert(source.to_owned());
+                }
+            } else {
+                errors.push(format!(
+                    "frozen coverage {}:{} has no source",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
+        if sources != manifest {
+            errors.push(format!(
+                "frozen coverage sources for {name} do not match the manifest"
+            ));
+        }
+        if Some(record_count) != expected_count {
+            errors.push(format!(
+                "{name} count does not match the frozen inventory summary"
+            ));
+        }
+        analyzed_by_file.insert(name.to_owned(), analyzed);
+    }
+    let decision_lines = fs::read_to_string(inventory.join("decision-coverage.jsonl"))
+        .map(|content| content.lines().count() as u64)
+        .ok();
+    if decision_lines != decision_count {
+        errors
+            .push("decision coverage count does not match the frozen inventory summary".to_owned());
+    }
+    analyzed_by_file
+}
+
+fn inventory_commit_ids(inventory: &Path, errors: &mut Vec<String>) -> BTreeSet<String> {
+    inventory_jsonl_values(inventory, "commits.jsonl", "commit", errors)
+}
+
+fn inventory_file_paths(
+    inventory: &Path,
+    analyzed_untracked: &BTreeSet<String>,
+    errors: &mut Vec<String>,
+) -> BTreeSet<String> {
+    let path = inventory.join("tracked-paths.json");
+    let mut paths = match fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .and_then(|value| value.as_array().cloned())
+    {
+        Some(values) => values
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        None => {
+            errors.push(format!(
+                "cannot read frozen tracked paths {}",
+                path.display()
+            ));
+            BTreeSet::new()
+        }
+    };
+    let untracked = inventory.join("untracked.jsonl");
+    if untracked.exists() {
+        let mut untracked_paths =
+            inventory_jsonl_values(inventory, "untracked.jsonl", "path", errors);
+        untracked_paths.retain(|path| analyzed_untracked.contains(&format!("untracked:{path}")));
+        paths.extend(untracked_paths);
+    }
+    paths
+}
+
+fn inventory_jsonl_values(
+    inventory: &Path,
+    name: &str,
+    field: &str,
+    errors: &mut Vec<String>,
+) -> BTreeSet<String> {
+    let path = inventory.join(name);
+    let Ok(content) = fs::read_to_string(&path) else {
+        errors.push(format!("cannot read frozen inventory {}", path.display()));
+        return BTreeSet::new();
+    };
+    let mut values = BTreeSet::new();
+    for (index, line) in content.lines().enumerate() {
+        match serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|value| value.get(field).and_then(Value::as_str).map(str::to_owned))
+        {
+            Some(value) => {
+                values.insert(value);
+            }
+            None => errors.push(format!(
+                "frozen inventory {}:{} has no string field '{field}'",
+                path.display(),
+                index + 1
+            )),
+        }
+    }
+    values
+}
+
+fn validate_occurred_at_semantics(event: &Value, errors: &mut Vec<String>) {
+    let Some(occurred_at) = event.get("occurred_at").and_then(Value::as_str) else {
+        return;
+    };
+    let required_role = match event.get("type").and_then(Value::as_str) {
+        Some("decision") => "choice",
+        Some("attempt") => "outcome",
+        _ => return,
+    };
+    let matches = event
+        .get("evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|evidence| {
+            evidence.get("role").and_then(Value::as_str) == Some(required_role)
+                && evidence.get("observed_at").and_then(Value::as_str) == Some(occurred_at)
+        });
+    if !matches {
+        let id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        errors.push(format!(
+            "candidate event '{id}' occurred_at must equal {required_role} evidence observed_at"
+        ));
+    }
+}
+
+fn validate_reconstruction_evidence(
+    label: &str,
+    evidence: Option<&Vec<Value>>,
+    conversations: &BTreeSet<String>,
+    commits: &BTreeSet<String>,
+    files: &BTreeSet<String>,
+    used_conversations: &mut BTreeMap<String, String>,
+    errors: &mut Vec<String>,
+) {
+    let mut accepted = 0;
+    for item in evidence.into_iter().flatten() {
+        let Some(reference) = evidence_reference(item) else {
+            errors.push(format!("{label} has evidence without a ref"));
+            continue;
+        };
+        if reference.starts_with("conversation:") {
+            if !conversations.contains(reference) {
+                errors.push(format!(
+                    "{label} uses conversation evidence outside the frozen inventory: '{reference}'"
+                ));
+            } else {
+                accepted += 1;
+            }
+            let owner = if label.starts_with("model entry") {
+                "model"
+            } else {
+                "event"
+            };
+            if let Some(previous) =
+                used_conversations.insert(reference.to_owned(), owner.to_owned())
+                && previous != owner
+            {
+                errors.push(format!(
+                    "conversation evidence '{reference}' is used by both event and model candidates"
+                ));
+            }
+        } else if let Some(commit) = reference.strip_prefix("commit:") {
+            if !commits.contains(commit) {
+                errors.push(format!(
+                    "{label} uses commit outside the frozen inventory: '{commit}'"
+                ));
+            } else {
+                accepted += 1;
+            }
+        } else if let Some(file) = reference.strip_prefix("file:") {
+            let path = file.split('#').next().unwrap_or(file);
+            if !files.contains(path) {
+                errors.push(format!(
+                    "{label} uses file outside the frozen inventory: '{path}'"
+                ));
+            } else {
+                accepted += 1;
+            }
+        } else {
+            errors.push(format!(
+                "{label} has unsupported evidence ref '{reference}'"
+            ));
+        }
+    }
+    if accepted == 0 {
+        errors.push(format!(
+            "{label} requires at least one analyzed frozen-inventory evidence item"
+        ));
+    }
+}
+
 fn valid_candidate_key(id: &str) -> bool {
     id.strip_prefix("candidate:").is_some_and(|suffix| {
-        !suffix.is_empty()
-            && suffix.len() <= 240
-            && suffix
-                .chars()
+        let mut characters = suffix.chars();
+        suffix.len() <= 240
+            && characters
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+            && characters
                 .all(|character| character.is_ascii_alphanumeric() || "._:-".contains(character))
     })
 }
@@ -1032,22 +1803,43 @@ fn event_date(event: &Value) -> &str {
     event.get("date").and_then(Value::as_str).unwrap_or("")
 }
 
-fn event_timeline_key(event: &Value) -> i128 {
-    if let Some(timestamp) = event
+fn event_timestamp(event: &Value) -> Option<i128> {
+    event
         .get("occurred_at")
         .and_then(Value::as_str)
         .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-    {
-        return timestamp.unix_timestamp_nanos();
+        .map(|timestamp| timestamp.unix_timestamp_nanos())
+}
+
+fn sort_timeline_items<T>(items: &mut [T], event: impl Fn(&T) -> &Value) {
+    items.sort_by_key(|item| event_date(event(item)).to_owned());
+    let mut date_start = 0;
+    while date_start < items.len() {
+        let date = event_date(event(&items[date_start])).to_owned();
+        let mut date_end = date_start + 1;
+        while date_end < items.len() && event_date(event(&items[date_end])) == date {
+            date_end += 1;
+        }
+        let mut run_start = date_start;
+        while run_start < date_end {
+            if event_timestamp(event(&items[run_start])).is_none() {
+                run_start += 1;
+                continue;
+            }
+            let mut run_end = run_start + 1;
+            while run_end < date_end && event_timestamp(event(&items[run_end])).is_some() {
+                run_end += 1;
+            }
+            items[run_start..run_end]
+                .sort_by_key(|item| event_timestamp(event(item)).unwrap_or(i128::MIN));
+            run_start = run_end;
+        }
+        date_start = date_end;
     }
-    Date::parse(
-        event_date(event),
-        &format_description!("[year]-[month]-[day]"),
-    )
-    .ok()
-    .and_then(|date| date.with_hms(0, 0, 0).ok())
-    .map(|date_time| date_time.assume_utc().unix_timestamp_nanos())
-    .unwrap_or(i128::MIN)
+}
+
+fn sort_event_values_in_timeline_order(events: &mut [Value]) {
+    sort_timeline_items(events, |event| event);
 }
 
 fn merge_events_in_timeline_order(
@@ -1055,9 +1847,9 @@ fn merge_events_in_timeline_order(
     existing_events: &[Value],
     new_events: &[Value],
 ) -> Result<String, StoreError> {
-    let already_ordered = existing_events
-        .windows(2)
-        .all(|events| event_timeline_key(&events[0]) <= event_timeline_key(&events[1]));
+    let mut ordered_events = existing_events.to_vec();
+    sort_event_values_in_timeline_order(&mut ordered_events);
+    let already_ordered = ordered_events == existing_events;
     if new_events.is_empty() && already_ordered {
         return Ok(existing_text.to_owned());
     }
@@ -1068,18 +1860,17 @@ fn merge_events_in_timeline_order(
             "cannot align canonical event lines with parsed events".to_owned(),
         ));
     }
-    let mut lines: Vec<(i128, String)> = existing_events
+    let mut lines: Vec<(Value, String)> = existing_events
         .iter()
         .zip(existing_lines)
-        .map(|(event, line)| (event_timeline_key(event), line.to_owned()))
+        .map(|(event, line)| (event.clone(), line.to_owned()))
         .collect();
     for event in new_events {
         let line = serde_json::to_string(event)
             .map_err(|error| StoreError::Environment(format!("cannot serialize event: {error}")))?;
-        lines.push((event_timeline_key(event), line));
+        lines.push((event.clone(), line));
     }
-    // Rust's stable sort retains canonical or candidate order when only day precision exists.
-    lines.sort_by_key(|line| line.0);
+    sort_timeline_items(&mut lines, |line| &line.0);
     Ok(lines
         .into_iter()
         .map(|(_, line)| line)
@@ -2744,8 +3535,12 @@ mod tests {
     #[test]
     fn reconstruction_candidate_keys_cannot_collide_or_cycle() {
         assert!(valid_candidate_key("candidate:decision-one"));
+        assert!(!valid_candidate_key("candidate::decision"));
+        assert!(!valid_candidate_key("candidate:.decision"));
         assert!(!valid_candidate_key("D-0001"));
         assert!(!valid_candidate_key("A-0001"));
+        assert!(valid_model_candidate("architecture:decision-one").is_some());
+        assert!(valid_model_candidate("architecture:a:b").is_none());
         let remap = BTreeMap::from([
             ("candidate:first".to_owned(), "candidate:second".to_owned()),
             ("candidate:second".to_owned(), "candidate:first".to_owned()),
@@ -2856,6 +3651,39 @@ mod tests {
         let error = add_attempt(directory.path(), attempt("unknown"));
         assert!(matches!(error, Err(StoreError::Invalid(_))));
         assert_eq!(fs::read_to_string(path).expect("read events"), before);
+    }
+
+    #[test]
+    fn timeline_sort_treats_unknown_same_day_time_as_a_barrier() {
+        let event = |subject: &str, occurred_at: Option<&str>| {
+            let mut value = json!({"date": "2026-07-19", "subject": subject});
+            if let Some(occurred_at) = occurred_at {
+                value["occurred_at"] = Value::String(occurred_at.to_owned());
+            }
+            value
+        };
+        let mut events = vec![
+            event("late-before", Some("2026-07-19T11:00:00Z")),
+            event("early-before", Some("2026-07-19T09:00:00Z")),
+            event("unknown", None),
+            event("late-after", Some("2026-07-19T10:00:00Z")),
+            event("early-after", Some("2026-07-19T08:00:00Z")),
+        ];
+        sort_event_values_in_timeline_order(&mut events);
+        let subjects: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event.get("subject").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            subjects,
+            [
+                "early-before",
+                "late-before",
+                "unknown",
+                "early-after",
+                "late-after"
+            ]
+        );
     }
 
     #[test]

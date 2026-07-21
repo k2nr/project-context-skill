@@ -138,7 +138,8 @@ uses `project-context configure` to update only explicitly supplied project and
 operation fields, then runs `project-context doctor --installation` and strict
 validation. Existing intent sections and event history are preserved. Event
 records are stored in timeline order, using exact `occurred_at` timestamps when
-available; events with only the same date retain their established source order.
+available. Unknown-time same-date records retain their established source position and act as
+barriers; exact timestamps are sorted only on either side of them.
 New stores use schema v2 with structured evidence, typed event relationships,
 evidence-backed model entries, and extensible structured operations. Existing
 schema v1 stores remain readable and can be upgraded atomically with
@@ -167,8 +168,11 @@ or a worktree sharing its Git common directory; unrelated conversations are
 never selected by searching their content.
 
 After approval, evidence-qualified model additions and new decision or attempt
-events are applied automatically through `project-context
-apply-reconstruction`. The command rejects stale base snapshots with exit
+events are checked and applied automatically through `project-context
+check-reconstruction` and `project-context apply-reconstruction`, both with the frozen source
+inventory. Both commands run the same completeness, provenance, candidate-schema, and relationship
+gate; checking is side-effect free and apply repeats validation under the repository lock. Apply
+rejects stale base snapshots with exit
 status `3`, preserves existing intent and event bytes, and makes repeated
 semantic candidates a no-op. Canonical evidence records only provider, session
 ID, and record index, not transcript paths or transcript text.

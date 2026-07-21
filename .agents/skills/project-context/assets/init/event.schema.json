@@ -1,30 +1,50 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:project-context:event:1",
+  "$id": "urn:project-context:event:2",
   "title": "Project Context Event",
   "oneOf": [
     { "$ref": "#/$defs/decision" },
     { "$ref": "#/$defs/attempt" }
   ],
   "$defs": {
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref"],
+      "properties": {
+        "ref": { "type": "string", "minLength": 1 },
+        "role": { "enum": ["choice", "rationale", "outcome", "implementation", "context"] },
+        "observed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "relation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "kind"],
+      "properties": {
+        "event": { "type": "string", "pattern": "^[DA]-[0-9]+$" },
+        "kind": { "enum": ["supersedes", "partially_supersedes", "informed_by", "validated_by", "implements", "contradicts", "related"] },
+        "scope": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "partially_supersedes" } }, "required": ["kind"] },
+          "then": { "required": ["scope"] }
+        }
+      ]
+    },
     "common": {
       "type": "object",
       "required": ["schema_version", "type", "id", "date", "subject"],
       "properties": {
-        "schema_version": { "const": 1 },
+        "schema_version": { "const": 2 },
         "type": { "type": "string" },
         "id": { "type": "string" },
-        "date": {
-          "type": "string",
-          "format": "date",
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-        },
+        "date": { "type": "string", "format": "date", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "occurred_at": { "type": "string", "format": "date-time" },
         "subject": { "type": "string", "minLength": 1 },
-        "evidence": {
-          "type": "array",
-          "items": { "type": "string", "minLength": 1 },
-          "uniqueItems": true
-        }
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" }, "uniqueItems": true },
+        "relations": { "type": "array", "items": { "$ref": "#/$defs/relation" }, "uniqueItems": true }
       }
     },
     "decision": {
@@ -35,17 +55,18 @@
           "additionalProperties": false,
           "required": ["schema_version", "type", "id", "date", "subject", "decision", "reason"],
           "properties": {
-            "schema_version": { "const": 1 },
+            "schema_version": { "const": 2 },
             "type": { "const": "decision" },
             "id": { "type": "string", "pattern": "^D-[0-9]+$" },
             "date": { "type": "string", "format": "date", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+            "occurred_at": { "type": "string", "format": "date-time" },
             "subject": { "type": "string", "minLength": 1 },
             "decision": { "type": "string", "minLength": 1 },
             "reason": { "type": "string", "minLength": 1 },
-            "rejected": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-            "supersedes": { "type": "array", "items": { "type": "string", "pattern": "^D-[0-9]+$" }, "uniqueItems": true },
+            "rejected": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
             "conditions": { "type": "string", "minLength": 1 },
-            "evidence": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+            "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" }, "uniqueItems": true },
+            "relations": { "type": "array", "items": { "$ref": "#/$defs/relation" }, "uniqueItems": true }
           }
         }
       ]
@@ -58,16 +79,18 @@
           "additionalProperties": false,
           "required": ["schema_version", "type", "id", "date", "subject", "approach", "result", "finding"],
           "properties": {
-            "schema_version": { "const": 1 },
+            "schema_version": { "const": 2 },
             "type": { "const": "attempt" },
             "id": { "type": "string", "pattern": "^A-[0-9]+$" },
             "date": { "type": "string", "format": "date", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+            "occurred_at": { "type": "string", "format": "date-time" },
             "subject": { "type": "string", "minLength": 1 },
             "approach": { "type": "string", "minLength": 1 },
             "result": { "enum": ["succeeded", "failed", "partial", "inconclusive"] },
             "finding": { "type": "string", "minLength": 1 },
             "conditions": { "type": "string", "minLength": 1 },
-            "evidence": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+            "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" }, "uniqueItems": true },
+            "relations": { "type": "array", "items": { "$ref": "#/$defs/relation" }, "uniqueItems": true }
           }
         }
       ]

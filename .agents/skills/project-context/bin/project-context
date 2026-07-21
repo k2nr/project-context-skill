@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-PROJECT_CONTEXT_VERSION="0.1.6"
+PROJECT_CONTEXT_VERSION="0.1.7"
 PROJECT_CONTEXT_RELEASE_REPOSITORY="k2nr/project-context-skill"
 DEFAULT_RELEASE_BASE_URL="https://github.com/${PROJECT_CONTEXT_RELEASE_REPOSITORY}/releases/download"
 
@@ -13,6 +13,31 @@ fail() {
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
+
+source_checkout_root() {
+  script_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P) \
+    || fail "cannot resolve launcher directory"
+  for candidate in "${script_directory}/../.." "${script_directory}/../../../.."; do
+    candidate=$(CDPATH='' cd -- "$candidate" 2>/dev/null && pwd -P) || continue
+    if { [ -d "${candidate}/.git" ] || [ -f "${candidate}/.git" ]; } \
+      && [ -f "${candidate}/cli/Cargo.toml" ] \
+      && [ -f "${candidate}/cli/Cargo.lock" ] \
+      && [ -f "${candidate}/bin/check" ] \
+      && [ -f "${candidate}/project-context/SKILL.md" ] \
+      && [ -f "${candidate}/reconstruct-project-context/SKILL.md" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ "${PROJECT_CONTEXT_BOOTSTRAP_TESTING:-}" != "1" ]; then
+  if checkout_root=$(source_checkout_root); then
+    require_command cargo
+    exec cargo run --locked --quiet --manifest-path "${checkout_root}/cli/Cargo.toml" -- "$@"
+  fi
+fi
 
 sha256() {
   checksum_file=$1

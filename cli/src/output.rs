@@ -1,7 +1,8 @@
 use crate::context::ContextPacket;
 use crate::doctor::DoctorReport;
 use crate::store::{
-    ConfigureReport, InitReport, MigrateReport, ReconstructionReport, ValidationReport,
+    ConfigureReport, InitReport, MigrateReport, ReconstructionCheckReport, ReconstructionReport,
+    ValidationReport,
 };
 use clap::ValueEnum;
 use serde::Serialize;
@@ -55,6 +56,19 @@ pub fn render_reconstruction(report: &ReconstructionReport, format: OutputFormat
             report.model_changed,
             report.events_added,
             report.duplicates_skipped
+        ),
+        _ => render_serializable(report, format),
+    }
+}
+
+pub fn render_reconstruction_check(
+    report: &ReconstructionCheckReport,
+    format: OutputFormat,
+) -> String {
+    match format {
+        OutputFormat::Text => format!(
+            "reconstruction valid\nmodel changed: {}\nevents added: {}\nduplicates skipped: {}\nno-op: {}",
+            report.model_changed, report.events_added, report.duplicates_skipped, report.no_op
         ),
         _ => render_serializable(report, format),
     }

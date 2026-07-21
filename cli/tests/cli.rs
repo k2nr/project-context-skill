@@ -1,7 +1,7 @@
 use fs2::FileExt;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use tempfile::TempDir;
 
@@ -49,6 +49,71 @@ fn install_skill_fixture(root: &Path) {
         root.join("AGENTS.md"),
     )
     .expect("copy managed AGENTS block");
+}
+
+fn reconstruction_inventory(
+    root: &Path,
+    decision_coverage: &str,
+    conversations: &[&str],
+    tracked: &[&str],
+) -> PathBuf {
+    let inventory = root.join("inventory");
+    fs::create_dir(&inventory).expect("create reconstruction inventory");
+    fs::write(inventory.join("decision-coverage.jsonl"), decision_coverage)
+        .expect("write decision coverage");
+    fs::write(inventory.join("commits.jsonl"), "").expect("write commits inventory");
+    fs::write(inventory.join("commit-coverage.jsonl"), "").expect("write commit coverage");
+    let conversation_coverage = conversations
+        .iter()
+        .map(|source| serde_json::json!({"source": source, "status": "analyzed"}).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        inventory.join("conversation-coverage.jsonl"),
+        if conversation_coverage.is_empty() {
+            conversation_coverage
+        } else {
+            conversation_coverage + "\n"
+        },
+    )
+    .expect("write conversation coverage");
+    fs::write(
+        inventory.join("tracked-paths.json"),
+        serde_json::to_string(tracked).expect("serialize tracked paths"),
+    )
+    .expect("write tracked paths");
+    fs::write(
+        inventory.join("coverage-sources.json"),
+        serde_json::to_string(&serde_json::json!({
+            "version": 1,
+            "sources": {
+                "commit-coverage.jsonl": [],
+                "conversation-coverage.jsonl": conversations,
+                "decision-coverage.jsonl": decision_coverage
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .filter_map(|record| record.get("source").and_then(Value::as_str).map(str::to_owned))
+                    .collect::<Vec<_>>()
+            }
+        }))
+        .expect("serialize coverage sources"),
+    )
+    .expect("write coverage sources");
+    fs::write(
+        inventory.join("summary.json"),
+        serde_json::to_string(&serde_json::json!({
+            "selected": {"non_ignored_untracked": false},
+            "counts": {
+                "commits": 0,
+                "conversation_records": conversations.len(),
+                "decision_signals": decision_coverage.lines().count(),
+                "untracked_coverage": 0
+            }
+        }))
+        .expect("serialize inventory summary"),
+    )
+    .expect("write inventory summary");
+    inventory
 }
 
 #[test]
@@ -357,6 +422,16 @@ fn reconstruction_applies_atomically_and_is_idempotent() {
         ),
     )
     .expect("write proposed events");
+    let inventory = reconstruction_inventory(
+        directory.path(),
+        concat!(
+            "{\"source\":\"conversation:codex:fixture#4\",\"status\":\"decision\",",
+            "\"topic\":\"history reconstruction\",\"candidate\":\"candidate:decision\",",
+            "\"rationale\":\"It contains durable project intent.\"}\n"
+        ),
+        &["conversation:codex:fixture#4"],
+        &["src/history.rs"],
+    );
 
     let arguments = [
         "apply-reconstruction",
@@ -368,9 +443,40 @@ fn reconstruction_applies_atomically_and_is_idempotent() {
         proposed_model.to_str().expect("proposed model path"),
         "--events",
         proposed_events.to_str().expect("proposed events path"),
+        "--inventory",
+        inventory.to_str().expect("inventory path"),
         "--format",
         "json",
     ];
+    let check_arguments = [
+        "check-reconstruction",
+        "--base-model",
+        base_model.to_str().expect("base model path"),
+        "--base-events",
+        base_events.to_str().expect("base events path"),
+        "--model",
+        proposed_model.to_str().expect("proposed model path"),
+        "--events",
+        proposed_events.to_str().expect("proposed events path"),
+        "--inventory",
+        inventory.to_str().expect("inventory path"),
+        "--format",
+        "json",
+    ];
+    let model_before_check = fs::read(context.join("model.yaml")).expect("model before check");
+    let events_before_check = fs::read(context.join("events.jsonl")).expect("events before check");
+    let checked = cli(directory.path(), &check_arguments);
+    assert!(checked.status.success(), "{}", stdout(&checked));
+    let check_report: Value = serde_json::from_slice(&checked.stdout).expect("check report JSON");
+    assert_eq!(check_report["valid"], true);
+    assert_eq!(
+        fs::read(context.join("model.yaml")).unwrap(),
+        model_before_check
+    );
+    assert_eq!(
+        fs::read(context.join("events.jsonl")).unwrap(),
+        events_before_check
+    );
     let first = cli(directory.path(), &arguments);
     assert!(first.status.success(), "{}", stdout(&first));
     let report: Value = serde_json::from_slice(&first.stdout).expect("report JSON");
@@ -378,6 +484,12 @@ fn reconstruction_applies_atomically_and_is_idempotent() {
     assert_eq!(report["events_added"], 1);
     assert_eq!(report["duplicates_skipped"], 0);
     assert_eq!(report["no_op"], false);
+    assert_eq!(report["model_changed"], check_report["model_changed"]);
+    assert_eq!(report["events_added"], check_report["events_added"]);
+    assert_eq!(
+        report["duplicates_skipped"],
+        check_report["duplicates_skipped"]
+    );
     let original_events = fs::read(&base_events).expect("original events");
     let applied_events = fs::read(context.join("events.jsonl")).expect("applied events");
     assert!(applied_events.starts_with(&original_events));
@@ -391,6 +503,69 @@ fn reconstruction_applies_atomically_and_is_idempotent() {
     assert_eq!(report["events_added"], 0);
     assert_eq!(report["duplicates_skipped"], 1);
     assert_eq!(report["no_op"], true);
+}
+
+#[test]
+fn reconstruction_requires_exact_model_signal_evidence() {
+    let directory = TempDir::new().expect("temporary directory");
+    assert!(cli(directory.path(), &["init"]).status.success());
+    let context = directory.path().join(".project-context");
+    let base_model = directory.path().join("base-model.yaml");
+    let base_events = directory.path().join("base-events.jsonl");
+    let proposed_model = directory.path().join("proposed-model.yaml");
+    let proposed_events = directory.path().join("proposed-events.jsonl");
+    fs::copy(context.join("model.yaml"), &base_model).expect("copy base model");
+    fs::copy(context.join("events.jsonl"), &base_events).expect("copy base events");
+    let source = "conversation:codex:model-fixture#7";
+    let model = fs::read_to_string(&base_model)
+        .expect("read base model")
+        .replace(
+            "architecture: []",
+            concat!(
+                "architecture:\n",
+                "  - id: model-signal\n",
+                "    statement: Preserve model-only intent.\n",
+                "    evidence:\n",
+                "      - ref: conversation:codex:model-fixture#7\n",
+                "        role: choice"
+            ),
+        );
+    fs::write(&proposed_model, model).expect("write proposed model");
+    fs::write(&proposed_events, "").expect("write proposed events");
+    let inventory = reconstruction_inventory(
+        directory.path(),
+        concat!(
+            "{\"source\":\"conversation:codex:model-fixture#7\",\"status\":\"model\",",
+            "\"topic\":\"model-only intent\",\"candidate\":\"architecture:model-signal\"}\n"
+        ),
+        &[source],
+        &[],
+    );
+    let arguments = [
+        "check-reconstruction",
+        "--base-model",
+        base_model.to_str().expect("base model path"),
+        "--base-events",
+        base_events.to_str().expect("base events path"),
+        "--model",
+        proposed_model.to_str().expect("proposed model path"),
+        "--events",
+        proposed_events.to_str().expect("proposed events path"),
+        "--inventory",
+        inventory.to_str().expect("inventory path"),
+        "--format",
+        "json",
+    ];
+    let valid = cli(directory.path(), &arguments);
+    assert!(valid.status.success(), "{}", stdout(&valid));
+
+    let invalid_model = fs::read_to_string(&proposed_model)
+        .expect("read proposed model")
+        .replace(source, "conversation:codex:model-fixture#8");
+    fs::write(&proposed_model, invalid_model).expect("write invalid proposed model");
+    let invalid = cli(directory.path(), &arguments);
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(stdout(&invalid).contains("absent from 'architecture:model-signal' evidence"));
 }
 
 #[test]
@@ -416,11 +591,20 @@ fn reconstruction_writes_a_stable_event_timeline() {
     fs::write(
         &proposed_events,
         concat!(
-            "{\"schema_version\":2,\"type\":\"attempt\",\"id\":\"candidate:middle-attempt\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T10:00:00Z\",\"subject\":\"middle attempt\",\"approach\":\"try\",\"result\":\"failed\",\"finding\":\"finding\"}\n",
-            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"candidate:middle-decision\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T09:00:00Z\",\"subject\":\"middle decision\",\"decision\":\"middle\",\"reason\":\"middle\"}\n",
+            "{\"schema_version\":2,\"type\":\"attempt\",\"id\":\"candidate:middle-attempt\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T10:00:00Z\",\"subject\":\"middle attempt\",\"approach\":\"try\",\"result\":\"failed\",\"finding\":\"finding\",\"evidence\":[{\"ref\":\"conversation:codex:fixture#2\",\"role\":\"outcome\",\"observed_at\":\"2026-07-19T10:00:00Z\"}]}\n",
+            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"candidate:middle-decision\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T09:00:00Z\",\"subject\":\"middle decision\",\"decision\":\"middle\",\"reason\":\"middle\",\"evidence\":[{\"ref\":\"conversation:codex:fixture#1\",\"role\":\"choice\",\"observed_at\":\"2026-07-19T09:00:00Z\"}]}\n",
         ),
     )
     .expect("write proposed events");
+    let inventory = reconstruction_inventory(
+        directory.path(),
+        "",
+        &[
+            "conversation:codex:fixture#1",
+            "conversation:codex:fixture#2",
+        ],
+        &[],
+    );
 
     let output = cli(
         directory.path(),
@@ -434,6 +618,8 @@ fn reconstruction_writes_a_stable_event_timeline() {
             proposed_model.to_str().expect("proposed model path"),
             "--events",
             proposed_events.to_str().expect("proposed events path"),
+            "--inventory",
+            inventory.to_str().expect("inventory path"),
             "--format",
             "json",
         ],
@@ -476,6 +662,7 @@ fn reconstruction_reports_base_conflicts_without_mutation() {
     fs::copy(context.join("events.jsonl"), &base_events).expect("copy base events");
     fs::copy(&base_model, &proposed_model).expect("copy proposed model");
     fs::write(&proposed_events, "").expect("empty proposed events");
+    let inventory = reconstruction_inventory(directory.path(), "", &[], &[]);
     assert!(
         cli(
             directory.path(),
@@ -509,6 +696,8 @@ fn reconstruction_reports_base_conflicts_without_mutation() {
             proposed_model.to_str().expect("proposed model path"),
             "--events",
             proposed_events.to_str().expect("proposed events path"),
+            "--inventory",
+            inventory.to_str().expect("inventory path"),
             "--format",
             "json",
         ],
@@ -534,6 +723,7 @@ fn reconstruction_reports_invalid_proposed_data_as_exit_one() {
     fs::copy(context.join("events.jsonl"), &base_events).expect("copy base events");
     fs::write(&proposed_model, "project: [invalid\n").expect("write invalid model");
     fs::write(&proposed_events, "").expect("empty proposed events");
+    let inventory = reconstruction_inventory(directory.path(), "", &[], &[]);
 
     let output = cli(
         directory.path(),
@@ -547,6 +737,8 @@ fn reconstruction_reports_invalid_proposed_data_as_exit_one() {
             proposed_model.to_str().expect("proposed model path"),
             "--events",
             proposed_events.to_str().expect("proposed events path"),
+            "--inventory",
+            inventory.to_str().expect("inventory path"),
             "--format",
             "json",
         ],

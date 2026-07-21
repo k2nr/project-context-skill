@@ -163,6 +163,11 @@ coverage = [json.loads(line) for line in (root / "conversation-coverage.jsonl").
 assert len(coverage) == summary["counts"]["conversation_records"]
 assert "pending" in {item["status"] for item in coverage}
 assert sum(item["records"] for item in summary["sessions"]) == len(coverage)
+assert all(
+    set(segment) == {"device", "inode", "mode", "cutoff_bytes", "prefix_sha256"}
+    for session in summary["sessions"]
+    for segment in session["frozen_segments"]
+)
 assert summary["counts"]["decision_signals"] == 2
 tracked = json.loads((root / "tracked-paths.json").read_text())
 assert ".project-context/model.yaml" not in tracked
@@ -252,18 +257,32 @@ assert summary["counts"]["tracked_paths"] == 0
 PY
 
 mutation_inventory="${test_root}/mutation-inventory"
-set +e
-mutation_output=$(
-  HOME="$home" \
-  PROJECT_CONTEXT_INVENTORY_TESTING=1 \
-  PROJECT_CONTEXT_INVENTORY_TEST_MUTATE_SESSION=1 \
-    "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
-      collect --root "$fixture" --output "$mutation_inventory" \
-      --include-conversations 2>&1
-)
-mutation_status=$?
-set -e
-[ "$mutation_status" -eq 2 ]
-printf '%s\n' "$mutation_output" | grep -Fq 'conversation source changed during collection'
+HOME="$home" \
+PROJECT_CONTEXT_INVENTORY_TESTING=1 \
+PROJECT_CONTEXT_INVENTORY_TEST_MUTATE_SESSION=append \
+  "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+    collect --root "$fixture" --output "$mutation_inventory" \
+    --include-conversations >/dev/null
+if grep -Fq 'appended-after-cutoff' "${mutation_inventory}/conversations.jsonl"; then
+  printf 'post-cutoff conversation append leaked into the frozen inventory\n' >&2
+  exit 1
+fi
+
+for mutation in prefix truncate replace remove; do
+  mutation_target="${test_root}/mutation-${mutation}"
+  set +e
+  mutation_output=$(
+    HOME="$home" \
+    PROJECT_CONTEXT_INVENTORY_TESTING=1 \
+    PROJECT_CONTEXT_INVENTORY_TEST_MUTATE_SESSION="$mutation" \
+      "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+        collect --root "$fixture" --output "$mutation_target" \
+        --include-conversations 2>&1
+  )
+  mutation_status=$?
+  set -e
+  [ "$mutation_status" -eq 2 ]
+  printf '%s\n' "$mutation_output" | grep -Fq 'conversation source'
+done
 
 printf 'reconstruction inventory tests passed\n'
