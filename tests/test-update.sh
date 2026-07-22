@@ -10,16 +10,16 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-update-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 
 release_root="${test_root}/release"
-mkdir -p "${release_root}/v0.2.0"
-"${repository_root}/bin/package-skill" 0.2.0 "${release_root}/v0.2.0" >/dev/null
+mkdir -p "${release_root}/v0.3.0"
+"${repository_root}/bin/package-skill" 0.3.0 "${release_root}/v0.3.0" >/dev/null
 
 current_extract="${test_root}/current"
 mkdir "$current_extract"
-tar -xzf "${release_root}/v0.2.0/project-context-skill-v0.2.0.tar.gz" -C "$current_extract"
+tar -xzf "${release_root}/v0.3.0/project-context-skill-v0.3.0.tar.gz" -C "$current_extract"
 
 old_extract="${test_root}/old"
 cp -R "$current_extract" "$old_extract"
-sed 's/PROJECT_CONTEXT_VERSION="0.2.0"/PROJECT_CONTEXT_VERSION="0.1.7"/' \
+sed 's/PROJECT_CONTEXT_VERSION="0.3.0"/PROJECT_CONTEXT_VERSION="0.2.0"/' \
   "${old_extract}/project-context/bin/project-context" \
   > "${test_root}/old-launcher"
 mv "${test_root}/old-launcher" "${old_extract}/project-context/bin/project-context"
@@ -27,8 +27,8 @@ chmod 755 "${old_extract}/project-context/bin/project-context" \
   "${old_extract}/project-context/bin/update-project-context" \
   "${old_extract}/reconstruct-project-context/scripts/inventory_local_history.py"
 
-mkdir -p "${release_root}/v0.1.7"
-old_archive="${release_root}/v0.1.7/project-context-skill-v0.1.7.tar.gz"
+mkdir -p "${release_root}/v0.2.0"
+old_archive="${release_root}/v0.2.0/project-context-skill-v0.2.0.tar.gz"
 (
   cd "$old_extract"
   COPYFILE_DISABLE=1 tar -czf "$old_archive" project-context reconstruct-project-context
@@ -45,7 +45,7 @@ system_name=$(uname -s)
 machine_name=$(uname -m)
 case "$system_name" in Darwin) target_system=apple-darwin ;; Linux) target_system=unknown-linux-gnu ;; esac
 case "$machine_name" in x86_64|amd64) target_arch=x86_64 ;; arm64|aarch64) target_arch=aarch64 ;; esac
-for version in 0.1.7 0.2.0; do
+for version in 0.2.0 0.3.0; do
   binary="${release_root}/v${version}/project-context-v${version}-${target_arch}-${target_system}"
   cp "${repository_root}/cli/target/debug/project-context" "$binary"
   chmod 700 "$binary"
@@ -84,7 +84,7 @@ run_update() {
   (
     cd "$target"
     PROJECT_CONTEXT_UPDATE_TESTING=1 \
-    PROJECT_CONTEXT_UPDATE_LATEST_VERSION=0.2.0 \
+    PROJECT_CONTEXT_UPDATE_LATEST_VERSION=0.3.0 \
     PROJECT_CONTEXT_RELEASE_BASE_URL="file://${release_root}" \
     TMPDIR="${test_root}" \
       .agents/skills/project-context/bin/update-project-context "$@"
@@ -102,15 +102,15 @@ cp "${target}/AGENTS.md" "${test_root}/agents.before"
 
 dry_run_output=$(run_update "$target" --dry-run --format json)
 printf '%s\n' "$dry_run_output" | validate_json
-printf '%s\n' "$dry_run_output" | grep -Fq '"latest_version": "0.2.0"'
+printf '%s\n' "$dry_run_output" | grep -Fq '"latest_version": "0.3.0"'
 printf '%s\n' "$dry_run_output" | grep -Fq '"skill":"planned-update"'
-grep -Fq 'PROJECT_CONTEXT_VERSION="0.1.7"' \
+grep -Fq 'PROJECT_CONTEXT_VERSION="0.2.0"' \
   "${target}/.agents/skills/project-context/bin/project-context"
 
 update_output=$(run_update "$target" --format json)
 printf '%s\n' "$update_output" | validate_json
 printf '%s\n' "$update_output" | grep -Fq '"skill":"updated"'
-grep -Fq 'PROJECT_CONTEXT_VERSION="0.2.0"' \
+grep -Fq 'PROJECT_CONTEXT_VERSION="0.3.0"' \
   "${target}/.agents/skills/project-context/bin/project-context"
 diff -qr "${current_extract}/project-context" \
   "${target}/.agents/skills/project-context" >/dev/null
@@ -133,7 +133,7 @@ conflict_status=$?
 set -e
 [ "$conflict_status" -eq 3 ]
 printf '%s\n' "$conflict_output" | validate_json
-printf '%s\n' "$conflict_output" | grep -Fq 'local changes relative to v0.1.7'
+printf '%s\n' "$conflict_output" | grep -Fq 'local changes relative to v0.2.0'
 diff -qr "${test_root}/conflict-agents.before" "${conflict_target}/.agents" >/dev/null
 
 agents_conflict_target="${test_root}/agents-conflict"
@@ -156,7 +156,7 @@ set +e
 rollback_output=$(
   cd "$rollback_target"
   PROJECT_CONTEXT_UPDATE_TESTING=1 \
-  PROJECT_CONTEXT_UPDATE_LATEST_VERSION=0.2.0 \
+  PROJECT_CONTEXT_UPDATE_LATEST_VERSION=0.3.0 \
   PROJECT_CONTEXT_RELEASE_BASE_URL="file://${release_root}" \
   PROJECT_CONTEXT_UPDATE_INJECT_FAILURE=1 \
   TMPDIR="${test_root}" \
@@ -177,7 +177,7 @@ set +e
 mid_swap_output=$(
   cd "$mid_swap_target"
   PROJECT_CONTEXT_UPDATE_TESTING=1 \
-  PROJECT_CONTEXT_UPDATE_LATEST_VERSION=0.2.0 \
+  PROJECT_CONTEXT_UPDATE_LATEST_VERSION=0.3.0 \
   PROJECT_CONTEXT_RELEASE_BASE_URL="file://${release_root}" \
   PROJECT_CONTEXT_UPDATE_INJECT_FAILURE=after-skill-backup \
   TMPDIR="${test_root}" \

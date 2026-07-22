@@ -10,16 +10,16 @@ test_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-installer-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 
 release_root="${test_root}/release"
-mkdir -p "${release_root}/v0.2.0"
-"${repository_root}/bin/package-skill" 0.2.0 "${release_root}/v0.2.0" >/dev/null
-"${repository_root}/bin/package-installer" 0.2.0 "${release_root}/v0.2.0" >/dev/null
-installer_under_test="${release_root}/v0.2.0/install-project-context-v0.2.0"
+mkdir -p "${release_root}/v0.3.0"
+"${repository_root}/bin/package-skill" 0.3.0 "${release_root}/v0.3.0" >/dev/null
+"${repository_root}/bin/package-installer" 0.3.0 "${release_root}/v0.3.0" >/dev/null
+installer_under_test="${release_root}/v0.3.0/install-project-context-v0.3.0"
 
 system_name=$(uname -s)
 machine_name=$(uname -m)
 case "$system_name" in Darwin) target_system=apple-darwin ;; Linux) target_system=unknown-linux-gnu ;; esac
 case "$machine_name" in x86_64|amd64) target_arch=x86_64 ;; arm64|aarch64) target_arch=aarch64 ;; esac
-binary="${release_root}/v0.2.0/project-context-v0.2.0-${target_arch}-${target_system}"
+binary="${release_root}/v0.3.0/project-context-v0.3.0-${target_arch}-${target_system}"
 cp "${repository_root}/cli/target/debug/project-context" "$binary"
 chmod 700 "$binary"
 if command -v sha256sum >/dev/null 2>&1; then
@@ -74,7 +74,7 @@ printf '%s\n' "$dry_run_output" | grep -Fq '"dry_run": true'
 bad_release="${test_root}/bad-release"
 cp -R "$release_root" "$bad_release"
 printf '%064d  unexpected-file\n' 0 \
-  > "${bad_release}/v0.2.0/project-context-skill-v0.2.0.tar.gz.sha256"
+  > "${bad_release}/v0.3.0/project-context-skill-v0.3.0.tar.gz.sha256"
 bad_checksum_repository="${test_root}/bad-checksum"
 mkdir "$bad_checksum_repository"
 git -C "$bad_checksum_repository" init -q

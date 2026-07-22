@@ -23,7 +23,7 @@ The official GitHub repository is `k2nr/project-context-skill`.
 Copy this instruction verbatim:
 
 ```text
-Install Project Context v0.2.0 into the current repository.
+Install Project Context v0.3.0 into the current repository.
 
 Official GitHub repository:
 k2nr/project-context-skill
@@ -33,13 +33,13 @@ Installation requirements:
    project ID, concise description, and real build, test, lint, and format
    commands. Explicitly identify any operation category that intentionally has
    no command.
-2. Download these assets for tag v0.2.0 into a private temporary directory:
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.2.0/install-project-context-v0.2.0
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.2.0/install-project-context-v0.2.0.sha256
-3. Verify the installer with `sha256sum -c install-project-context-v0.2.0.sha256`
-   or `shasum -a 256 -c install-project-context-v0.2.0.sha256`. Stop if it fails.
+2. Download these assets for tag v0.3.0 into a private temporary directory:
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.3.0/install-project-context-v0.3.0
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.3.0/install-project-context-v0.3.0.sha256
+3. Verify the installer with `sha256sum -c install-project-context-v0.3.0.sha256`
+   or `shasum -a 256 -c install-project-context-v0.3.0.sha256`. Stop if it fails.
 4. If `gh` already exists, run
-   `gh attestation verify install-project-context-v0.2.0 --repo k2nr/project-context-skill`.
+   `gh attestation verify install-project-context-v0.3.0 --repo k2nr/project-context-skill`.
    Stop if it fails. Do not install `gh`, Python packages, Cargo, shellcheck, or
    another tool solely for installation.
 5. Make the verified installer executable. Run it first with
@@ -60,7 +60,7 @@ Installation requirements:
 Example installer arguments after repository inspection:
 
 ```sh
-./install-project-context-v0.2.0 \
+./install-project-context-v0.3.0 \
   --format json \
   --project-id example-project \
   --description 'Concise project purpose.' \
@@ -199,9 +199,9 @@ or only the reconstruction skill exists, installation stops without changing
 the repository. Explicit `$project-context update` is the upgrade path; it
 likewise stops rather than overwriting local skill changes.
 
-The versioned public installation command above remains unchanged. Publishing
-the two-skill package, choosing a next version, and creating release assets are
-separate release work and are not performed by this source change.
+The versioned public installation command above tracks the prepared release.
+Release assets are published only by the verified workflow for an annotated
+version tag; ordinary source changes do not create or replace release assets.
 
 ## Supported Platforms
 
