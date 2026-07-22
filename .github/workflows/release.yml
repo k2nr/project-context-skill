@@ -50,9 +50,11 @@ jobs:
           remote_release_sha=$(git ls-remote origin "refs/tags/${REQUESTED_TAG}^{}" | awk 'NR == 1 { print $1 }')
           test "${remote_tag_object_sha}" = "${release_tag_object_sha}"
           test "${remote_release_sha}" = "${release_sha}"
-          printf 'release_tag=%s\n' "${REQUESTED_TAG}" >> "${GITHUB_OUTPUT}"
-          printf 'release_tag_object_sha=%s\n' "${release_tag_object_sha}" >> "${GITHUB_OUTPUT}"
-          printf 'release_sha=%s\n' "${release_sha}" >> "${GITHUB_OUTPUT}"
+          {
+            printf 'release_tag=%s\n' "${REQUESTED_TAG}"
+            printf 'release_tag_object_sha=%s\n' "${release_tag_object_sha}"
+            printf 'release_sha=%s\n' "${release_sha}"
+          } >> "${GITHUB_OUTPUT}"
 
   test:
     needs: resolve
@@ -90,9 +92,14 @@ jobs:
           cargo install cargo-audit --version 0.22.2 --locked
           cargo audit --file cli/Cargo.lock
       - name: Check workflow syntax
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
         run: |
           go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-          "$(go env GOPATH)/bin/actionlint" .github/workflows/release.yml
+          git fetch --no-tags origin "${WORKFLOW_SHA}"
+          git cat-file -e "${WORKFLOW_SHA}^{commit}"
+          git show "${WORKFLOW_SHA}:.github/workflows/release.yml" > /tmp/release.yml
+          "$(go env GOPATH)/bin/actionlint" /tmp/release.yml
 
   build-linux:
     needs: [resolve, test]
