@@ -24,6 +24,14 @@ Decision's reason after whitespace normalization. Do not downgrade an explicit c
 merely because the selected implementation is recoverable from code; the unrecoverable reason still
 belongs in a Decision.
 
+Independently classify every frozen tracked-document block. A commit-level `analyzed` status does
+not prove that every durable statement in a specification was extracted. A `recoverable` block must
+cite current code, tests, or schemas from the frozen inventory; another audited
+document is not recovery evidence. Document `decision` and `attempt` records must map to matching
+candidate events with exact block evidence and matching rationale or finding. A document `model`
+record must map to an exact normalized statement in the proposed model; new entries cite the block,
+while an unchanged base entry may satisfy the record only after independent candidate extraction.
+
 ## Decisions
 
 Create a decision only when evidence contains both the selected choice and its reason. A merged commit, final implementation, or repeated pattern alone does not prove rationale. Preserve rejected alternatives or conditions only when explicit evidence supports them.

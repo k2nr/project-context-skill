@@ -58,7 +58,7 @@ architecture:
   - ref: file:reconstruct-project-context/scripts/inventory_local_history.py
     role: implementation
   id: frozen-local-inventory
-  statement: Reconstruction freezes approved Git and repository-associated Codex or Claude sources into a private inventory, verifies record and decision coverage, then applies one integrated candidate set.
+  statement: Reconstruction freezes approved Git, tracked documentation, and repository-associated Codex or Claude sources into a private inventory, verifies record, document-block, and decision coverage, then applies one integrated candidate set.
 - evidence:
   - observed_at: 2026-07-17T06:25:18.314Z
     ref: conversation:codex:019f6e7f-d2ff-7e01-bfc4-e2c882d47a27#810
@@ -210,6 +210,14 @@ behaviors:
     role: choice
   id: reconstructed-complete-user-audit
   statement: Audit every direct-user decision signal separately so short approvals, corrections, and quoted proposals cannot be hidden by ordinary record coverage.
+- event_relations:
+  - event: D-0031
+    kind: origin
+  evidence:
+  - ref: file:reconstruct-project-context/scripts/inventory_local_history.py
+    role: implementation
+  id: tracked-document-completeness
+  statement: Reconstruction audits every block of selected tracked documentation and blocks apply until each block maps to durable model intent, a decision or attempt candidate, recoverable code or test evidence, an exclusion, or an unavailable reason.
 - evidence:
   - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
     role: implementation
@@ -384,7 +392,7 @@ principles:
   - ref: file:reconstruct-project-context/SKILL.md
     role: implementation
   id: evidence-before-conclusions
-  statement: Reconstruction conclusions must be evidence-qualified, cover every selected source and direct-user signal, and never use canonical model/events as truth.
+  statement: Reconstruction conclusions must be evidence-qualified, cover every selected source, tracked-document block, and direct-user signal, and never use canonical model/events as truth.
 - event_relations:
   - event: D-0005
     kind: origin

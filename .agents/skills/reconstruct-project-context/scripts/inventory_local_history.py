@@ -17,11 +17,21 @@ from typing import Any, Iterable
 MAX_METADATA_BYTES = 64 * 1024
 MAX_RECORD_BYTES = 2 * 1024 * 1024
 MAX_UNTRACKED_BYTES = 2 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 SESSION_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 CANDIDATE_ID_PATTERN = re.compile(r"candidate:[A-Za-z0-9][A-Za-z0-9._:-]{0,239}\Z")
 MODEL_CANDIDATE_PATTERN = re.compile(
     r"(?:principles|architecture|behaviors|constraints):[A-Za-z0-9][A-Za-z0-9._-]{0,239}\Z"
 )
+DOCUMENT_SUFFIXES = {".md", ".mdx", ".rst", ".adoc", ".asciidoc", ".txt"}
+DOCUMENT_BASENAMES = {"readme", "spec", "design", "architecture", "decisions", "roadmap"}
+RECOVERABLE_CODE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx",
+    ".kt", ".kts", ".lua", ".m", ".mm", ".php", ".py", ".rb", ".rs", ".scala",
+    ".sh", ".swift", ".ts", ".tsx", ".zig",
+}
+RECOVERABLE_DATA_SUFFIXES = {".json", ".jsonl", ".snap", ".toml", ".yaml", ".yml"}
+RECOVERABLE_SCHEMA_SUFFIXES = {".json", ".proto", ".xsd", ".yaml", ".yml"}
 STRING_FIELD = rb'"%s"\s*:\s*("(?:\\.|[^"\\])*")'
 FORBIDDEN_METADATA_KEYS = [
     b'"message"',
@@ -74,6 +84,55 @@ def tracked_paths(root: Path) -> list[str]:
     return sorted(run_git(root, "ls-files", "--", *evidence_pathspecs()).splitlines())
 
 
+def head_tracked_paths(root: Path) -> list[str]:
+    return sorted(
+        relative
+        for relative in run_git(root, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+        if not canonical_context_path(relative)
+    )
+
+
+def selected_tracked_paths(root: Path, include_worktree: bool) -> list[str]:
+    return tracked_paths(root) if include_worktree else head_tracked_paths(root)
+
+
+def document_path(relative: str) -> bool:
+    path = Path(relative)
+    return path.suffix.lower() in DOCUMENT_SUFFIXES or path.name.lower() in DOCUMENT_BASENAMES
+
+
+def recoverable_file_path(relative: str) -> bool:
+    path = Path(relative)
+    suffix = path.suffix.lower()
+    components = {part.lower() for part in path.parts[:-1]}
+    if suffix in RECOVERABLE_CODE_SUFFIXES:
+        return True
+    if path.name.lower().endswith(".schema.json"):
+        return True
+    if components & {"test", "tests"} and suffix in RECOVERABLE_DATA_SUFFIXES:
+        return True
+    return bool(components & {"schema", "schemas"} and suffix in RECOVERABLE_SCHEMA_SUFFIXES)
+
+
+def document_blocks(text: str) -> list[tuple[int, int, str]]:
+    blocks: list[tuple[int, int, str]] = []
+    lines = text.split("\n")
+    start: int | None = None
+    content: list[str] = []
+    for line_number, line in enumerate(lines, 1):
+        if line.strip():
+            if start is None:
+                start = line_number
+            content.append(line)
+        elif start is not None:
+            blocks.append((start, line_number - 1, "\n".join(content)))
+            start = None
+            content = []
+    if start is not None:
+        blocks.append((start, len(lines), "\n".join(content)))
+    return blocks
+
+
 def worktree_patch(root: Path) -> bytes:
     return subprocess.run(
         ["git", "-C", str(root), "diff", "--binary", "HEAD", "--", *evidence_pathspecs()],
@@ -83,7 +142,9 @@ def worktree_patch(root: Path) -> bytes:
 
 
 def canonical_context_path(relative: str) -> bool:
-    normalized = relative.replace("\\", "/").lstrip("./")
+    normalized = relative.replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
     return any(
         normalized == path or normalized.endswith(f"/{path}")
         for path in CANONICAL_CONTEXT_PATHS
@@ -762,6 +823,110 @@ def collect_untracked(
     return write_jsonl(output / "untracked-coverage.jsonl", coverage), identities
 
 
+def collect_documents(
+    output: Path, root: Path, include_worktree: bool
+) -> tuple[int, int]:
+    snapshots = output / "documents"
+    snapshots.mkdir(mode=0o700)
+    inventory: list[dict[str, Any]] = []
+    coverage: list[dict[str, Any]] = []
+    candidates = selected_tracked_paths(root, include_worktree)
+    for relative in candidates:
+        if not document_path(relative) or canonical_context_path(relative):
+            continue
+        source = f"file:{relative}"
+        if include_worktree:
+            path = safe_repository_path(root, relative)
+            if not regular_file(path):
+                inventory.append({"path": relative, "snapshot": None})
+                coverage.append(
+                    {"source": source, "status": "unavailable", "reason": "not a regular file"}
+                )
+                continue
+            before = fingerprint(path)
+            if before[2] > MAX_DOCUMENT_BYTES:
+                inventory.append({"path": relative, "snapshot": None, "bytes": before[2]})
+                coverage.append(
+                    {"source": source, "status": "unavailable", "reason": "oversized document"}
+                )
+                continue
+            content = path.read_bytes()
+            if fingerprint(path) != before:
+                raise InventoryError("tracked document changed during collection")
+        else:
+            tree = subprocess.run(
+                ["git", "-C", str(root), "ls-tree", "-z", "HEAD", "--", relative],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            mode = tree.stdout.split(b" ", 1)[0] if tree.returncode == 0 else b""
+            if mode not in {b"100644", b"100755"}:
+                inventory.append({"path": relative, "snapshot": None})
+                coverage.append(
+                    {
+                        "source": source,
+                        "status": "unavailable",
+                        "reason": "not a regular file in HEAD",
+                    }
+                )
+                continue
+            result = subprocess.run(
+                ["git", "-C", str(root), "show", f"HEAD:{relative}"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if result.returncode != 0:
+                inventory.append({"path": relative, "snapshot": None})
+                coverage.append(
+                    {
+                        "source": source,
+                        "status": "unavailable",
+                        "reason": result.stderr.decode("utf-8", "replace").strip()
+                        or "document unavailable",
+                    }
+                )
+                continue
+            content = result.stdout
+            if len(content) > MAX_DOCUMENT_BYTES:
+                inventory.append({"path": relative, "snapshot": None, "bytes": len(content)})
+                coverage.append(
+                    {"source": source, "status": "unavailable", "reason": "oversized document"}
+                )
+                continue
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            inventory.append({"path": relative, "snapshot": None, "bytes": len(content)})
+            coverage.append(
+                {"source": source, "status": "unavailable", "reason": "document is not UTF-8"}
+            )
+            continue
+        digest = hashlib.sha256(content).hexdigest()
+        snapshot = f"documents/{hashlib.sha256(relative.encode()).hexdigest()}-{digest}.txt"
+        snapshot_path = output / snapshot
+        snapshot_path.write_bytes(content)
+        os.chmod(snapshot_path, 0o600)
+        blocks = []
+        for start, end, _ in document_blocks(text):
+            block_source = f"file:{relative}#L{start}-L{end}"
+            blocks.append({"source": block_source, "start": start, "end": end})
+            coverage.append({"source": block_source, "status": "pending"})
+        inventory.append(
+            {
+                "path": relative,
+                "snapshot": snapshot,
+                "bytes": len(content),
+                "sha256": digest,
+                "blocks": blocks,
+            }
+        )
+    return write_jsonl(output / "documents.jsonl", inventory), write_jsonl(
+        output / "document-coverage.jsonl", coverage
+    )
+
+
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     if not args.include_git and not args.include_conversations:
         raise InventoryError("select --include-git, --include-conversations, or both")
@@ -795,10 +960,16 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     snapshots = output / "conversation-sources"
     if snapshots.exists():
         snapshots.rmdir()
-    tracked = tracked_paths(root) if args.include_git else []
+    tracked = selected_tracked_paths(root, args.include_worktree) if args.include_git else []
     (output / "tracked-paths.json").write_text(
         json.dumps(tracked, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    if args.include_git:
+        document_count, document_coverage_count = collect_documents(
+            output, root, args.include_worktree
+        )
+    else:
+        document_count, document_coverage_count = 0, 0
     worktree = b""
     if args.include_worktree:
         worktree = worktree_patch(root)
@@ -823,7 +994,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         current_repositories = selected_repositories(root, args)
         frozen = [(name, revisions) for name, _, revisions in repositories]
         current = [(name, revisions) for name, _, revisions in current_repositories]
-        if current != frozen or tracked_paths(root) != tracked:
+        if current != frozen or selected_tracked_paths(root, args.include_worktree) != tracked:
             raise InventoryError("Git sources changed during collection")
     if args.include_worktree:
         current_worktree = worktree_patch(root)
@@ -864,6 +1035,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             "parseable_conversation_records": conversation_count,
             "decision_signals": decision_coverage_count,
             "tracked_paths": len(tracked),
+            "documents": document_count,
+            "document_blocks": document_coverage_count,
             "untracked_paths": len(untracked),
             "untracked_coverage": untracked_coverage_count,
         },
@@ -880,6 +1053,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         "conversation-coverage.jsonl",
         "decision-coverage.jsonl",
     ]
+    if args.include_git:
+        coverage_names.append("document-coverage.jsonl")
     if args.include_untracked:
         coverage_names.append("untracked-coverage.jsonl")
     source_manifest: dict[str, list[str]] = {}
@@ -889,7 +1064,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
             raise InventoryError(f"{name} produced a missing or duplicate source")
         source_manifest[name] = sources
     (output / "coverage-sources.json").write_text(
-        json.dumps({"version": 1, "sources": source_manifest}, sort_keys=True) + "\n",
+        json.dumps({"version": 2, "sources": source_manifest}, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return summary
@@ -908,6 +1083,144 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def verify_document_coverage(
+    inventory: Path, summary: dict[str, Any], manifest: dict[str, Any]
+) -> dict[str, int]:
+    records = load_jsonl(inventory / "document-coverage.jsonl")
+    documents = load_jsonl(inventory / "documents.jsonl")
+    if len(documents) != summary["counts"]["documents"]:
+        raise InventoryError("documents.jsonl count does not match frozen inventory")
+    inventory_sources: set[str] = set()
+    document_paths_seen: set[str] = set()
+    for document in documents:
+        relative = document.get("path")
+        if not isinstance(relative, str) or relative in document_paths_seen:
+            raise InventoryError("documents.jsonl has a missing or duplicate path")
+        document_paths_seen.add(relative)
+        snapshot = document.get("snapshot")
+        if snapshot is None:
+            inventory_sources.add(f"file:{relative}")
+            continue
+        if not isinstance(snapshot, str) or not snapshot.startswith("documents/"):
+            raise InventoryError("documents.jsonl has an invalid snapshot path")
+        snapshot_path = inventory / snapshot
+        try:
+            snapshot_path.resolve().relative_to((inventory / "documents").resolve())
+        except (OSError, ValueError) as error:
+            raise InventoryError(f"documents.jsonl has an unsafe snapshot path: {error}") from error
+        content = snapshot_path.read_bytes()
+        if len(content) != document.get("bytes"):
+            raise InventoryError("frozen document size changed")
+        if hashlib.sha256(content).hexdigest() != document.get("sha256"):
+            raise InventoryError("frozen document digest changed")
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise InventoryError("frozen document is no longer UTF-8") from error
+        expected_blocks = [
+            {"source": f"file:{relative}#L{start}-L{end}", "start": start, "end": end}
+            for start, end, _ in document_blocks(text)
+        ]
+        recorded_blocks = document.get("blocks", [])
+        if recorded_blocks != expected_blocks:
+            raise InventoryError("frozen document blocks do not match its snapshot")
+        inventory_sources.update(block["source"] for block in expected_blocks)
+    expected = summary["counts"]["document_blocks"]
+    if len(records) != expected:
+        raise InventoryError("document-coverage.jsonl count does not match frozen inventory")
+    manifest_sources = manifest["sources"].get("document-coverage.jsonl")
+    sources: set[str] = set()
+    totals = {
+        "model": 0,
+        "decision": 0,
+        "attempt": 0,
+        "recoverable": 0,
+        "excluded": 0,
+        "unavailable": 0,
+    }
+    tracked = set(json.loads((inventory / "tracked-paths.json").read_text(encoding="utf-8")))
+    document_paths = {
+        record["path"]
+        for record in load_jsonl(inventory / "documents.jsonl")
+        if isinstance(record.get("path"), str)
+    }
+    for record in records:
+        source = record.get("source")
+        status_value = record.get("status")
+        if not isinstance(source, str) or source in sources:
+            raise InventoryError("document-coverage.jsonl has a missing or duplicate source")
+        sources.add(source)
+        if status_value not in totals:
+            raise InventoryError(
+                f"document-coverage.jsonl contains unresolved status {status_value!r}"
+            )
+        if status_value in {"model", "decision", "attempt", "recoverable"} and not record.get(
+            "topic"
+        ):
+            raise InventoryError(f"document-coverage.jsonl requires a topic for {status_value}")
+        if status_value == "model":
+            if not (
+                isinstance(record.get("candidate"), str)
+                and MODEL_CANDIDATE_PATTERN.fullmatch(record["candidate"])
+            ):
+                raise InventoryError(
+                    "document-coverage.jsonl requires a section:id candidate for model"
+                )
+            if not isinstance(record.get("statement"), str) or not record["statement"].strip():
+                raise InventoryError("document-coverage.jsonl requires statement for model")
+        if status_value in {"decision", "attempt"} and not (
+            isinstance(record.get("candidate"), str)
+            and CANDIDATE_ID_PATTERN.fullmatch(record["candidate"])
+        ):
+            raise InventoryError(
+                f"document-coverage.jsonl requires a candidate ID for {status_value}"
+            )
+        if status_value == "decision" and not record.get("rationale"):
+            raise InventoryError("document-coverage.jsonl requires rationale for decision")
+        if status_value == "attempt" and not record.get("finding"):
+            raise InventoryError("document-coverage.jsonl requires finding for attempt")
+        if status_value == "recoverable":
+            recovered_by = record.get("recovered_by")
+            if not isinstance(recovered_by, list) or not recovered_by:
+                raise InventoryError("document-coverage.jsonl requires recovered_by references")
+            for reference in recovered_by:
+                if not isinstance(reference, str):
+                    raise InventoryError("document recovered_by reference is not a string")
+                if reference.startswith("file:"):
+                    path = reference.removeprefix("file:").split("#", 1)[0]
+                    if path not in tracked:
+                        raise InventoryError(
+                            f"document recovered_by uses file outside frozen inventory: {path}"
+                        )
+                    if path in document_paths:
+                        raise InventoryError(
+                            "document recovered_by must cite code, tests, or schema"
+                        )
+                    if not recoverable_file_path(path):
+                        raise InventoryError(
+                            "document recovered_by must cite current code, tests, or schema"
+                        )
+                else:
+                    raise InventoryError(
+                        f"document recovered_by has unsupported ref: {reference}"
+                    )
+        if status_value in {"excluded", "unavailable"} and not record.get("reason"):
+            raise InventoryError(
+                f"document-coverage.jsonl requires a reason for {status_value}"
+            )
+        totals[status_value] += 1
+    if (
+        not isinstance(manifest_sources, list)
+        or len(manifest_sources) != len(records)
+        or len(set(manifest_sources)) != len(manifest_sources)
+        or sources != set(manifest_sources)
+    ):
+        raise InventoryError("document-coverage.jsonl sources do not match frozen manifest")
+    if sources != inventory_sources:
+        raise InventoryError("document-coverage.jsonl sources do not match frozen documents")
+    return totals
+
+
 def verify_coverage(inventory: Path) -> dict[str, Any]:
     summary = json.loads((inventory / "summary.json").read_text(encoding="utf-8"))
     specifications = [
@@ -919,9 +1232,15 @@ def verify_coverage(inventory: Path) -> dict[str, Any]:
             ("untracked-coverage.jsonl", summary["counts"]["untracked_coverage"])
         )
     manifest = json.loads((inventory / "coverage-sources.json").read_text(encoding="utf-8"))
-    if manifest.get("version") != 1 or not isinstance(manifest.get("sources"), dict):
+    if manifest.get("version") != 2:
+        raise InventoryError(
+            "coverage source manifest is unsupported; recollect the temporary inventory"
+        )
+    if not isinstance(manifest.get("sources"), dict):
         raise InventoryError("coverage source manifest is invalid")
     expected_names = {name for name, _ in specifications} | {"decision-coverage.jsonl"}
+    if summary["selected"]["git"]:
+        expected_names.add("document-coverage.jsonl")
     if set(manifest["sources"]) != expected_names:
         raise InventoryError("coverage source manifest does not match selected inventories")
     totals = {"analyzed": 0, "excluded": 0, "unavailable": 0}
@@ -996,6 +1315,8 @@ def verify_coverage(inventory: Path) -> dict[str, Any]:
     if not decision_sources <= set(manifest["sources"]["conversation-coverage.jsonl"]):
         raise InventoryError("decision coverage contains a non-conversation source")
     totals["decision_signals"] = decision_totals
+    if summary["selected"]["git"]:
+        totals["document_blocks"] = verify_document_coverage(inventory, summary, manifest)
     return totals
 
 
@@ -1004,6 +1325,13 @@ def verify_candidates(inventory: Path, events: Path) -> dict[str, Any]:
     decision_records = load_jsonl(inventory / "decision-coverage.jsonl")
     statuses = {record["source"]: record["status"] for record in decision_records}
     required_records = [record for record in decision_records if record["status"] == "decision"]
+    summary = json.loads((inventory / "summary.json").read_text(encoding="utf-8"))
+    document_records = (
+        load_jsonl(inventory / "document-coverage.jsonl") if summary["selected"]["git"] else []
+    )
+    required_document_events = [
+        record for record in document_records if record["status"] in {"decision", "attempt"}
+    ]
     event_records = load_jsonl(events)
     event_sources: set[str] = set()
     events_by_id: dict[str, dict[str, Any]] = {}
@@ -1049,6 +1377,25 @@ def verify_candidates(inventory: Path, events: Path) -> dict[str, Any]:
         audit_reason = " ".join(str(record["rationale"]).split())
         if event_reason != audit_reason:
             raise InventoryError(f"decision signal {source} rationale differs from {candidate}")
+    for record in required_document_events:
+        source = record["source"]
+        candidate = record["candidate"]
+        expected_type = record["status"]
+        event = events_by_id.get(candidate)
+        if event is None or event.get("type") != expected_type:
+            raise InventoryError(
+                f"document {expected_type} {source} references missing {candidate}"
+            )
+        if source not in evidence_by_id.get(candidate, []):
+            raise InventoryError(f"document source {source} is absent from {candidate} evidence")
+        field = "reason" if expected_type == "decision" else "finding"
+        audit_field = "rationale" if expected_type == "decision" else "finding"
+        actual = " ".join(str(event.get(field, "")).split())
+        expected = " ".join(str(record[audit_field]).split())
+        if actual != expected:
+            raise InventoryError(
+                f"document {expected_type} {source} {audit_field} differs from {candidate}"
+            )
     contradicted = sorted(
         source
         for source in event_sources
@@ -1059,10 +1406,42 @@ def verify_candidates(inventory: Path, events: Path) -> dict[str, Any]:
             "candidate event evidence contradicts decision coverage: "
             + ", ".join(contradicted)
         )
+    document_statuses = {record["source"]: record["status"] for record in document_records}
+    document_paths = {
+        record["path"]
+        for record in (
+            load_jsonl(inventory / "documents.jsonl") if summary["selected"]["git"] else []
+        )
+        if isinstance(record.get("path"), str)
+    }
+    invented_document_sources = sorted(
+        source
+        for source in event_sources
+        if source.startswith("file:")
+        and source.removeprefix("file:").split("#", 1)[0] in document_paths
+        and source not in document_statuses
+    )
+    if invented_document_sources:
+        raise InventoryError(
+            "candidate event evidence uses a document reference outside frozen blocks: "
+            + ", ".join(invented_document_sources)
+        )
+    contradicted_documents = sorted(
+        source
+        for source in event_sources
+        if source in document_statuses
+        and document_statuses[source] not in {"decision", "attempt"}
+    )
+    if contradicted_documents:
+        raise InventoryError(
+            "candidate event evidence contradicts document coverage: "
+            + ", ".join(contradicted_documents)
+        )
     return {
         "candidate_events": len(event_records),
         "decision_events": decision_event_count,
         "decision_signals_covered": len(required_records),
+        "document_event_signals_covered": len(required_document_events),
         "coverage": coverage,
     }
 

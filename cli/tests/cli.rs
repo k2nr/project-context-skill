@@ -85,7 +85,7 @@ fn reconstruction_inventory(
     fs::write(
         inventory.join("coverage-sources.json"),
         serde_json::to_string(&serde_json::json!({
-            "version": 1,
+            "version": 2,
             "sources": {
                 "commit-coverage.jsonl": [],
                 "conversation-coverage.jsonl": conversations,
@@ -102,11 +102,13 @@ fn reconstruction_inventory(
     fs::write(
         inventory.join("summary.json"),
         serde_json::to_string(&serde_json::json!({
-            "selected": {"non_ignored_untracked": false},
+            "selected": {"git": false, "conversations": true, "non_ignored_untracked": false},
             "counts": {
                 "commits": 0,
                 "conversation_records": conversations.len(),
                 "decision_signals": decision_coverage.lines().count(),
+                "documents": 0,
+                "document_blocks": 0,
                 "untracked_coverage": 0
             }
         }))

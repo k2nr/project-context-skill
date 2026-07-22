@@ -2,6 +2,7 @@ use fs2::FileExt;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -886,6 +887,8 @@ fn prepare_reconstruction(
         &input.inventory.join("decision-coverage.jsonl"),
         "decision coverage",
     )?;
+    let document_coverage =
+        fs::read_to_string(input.inventory.join("document-coverage.jsonl")).unwrap_or_default();
 
     let lock = open_lock(root, apply).map_err(StoreError::Environment)?;
     if apply {
@@ -925,6 +928,7 @@ fn prepare_reconstruction(
     validate_reconstruction_audit(
         &input.inventory,
         &decision_coverage,
+        &document_coverage,
         &proposed_model_value,
         &candidates,
         &current_data,
@@ -1072,12 +1076,14 @@ fn prepare_reconstruction(
 fn validate_reconstruction_audit(
     inventory: &Path,
     decision_coverage: &str,
+    document_coverage: &str,
     proposed_model: &Value,
     candidates: &[Value],
     current_data: &RepositoryData,
     errors: &mut Vec<String>,
 ) {
     let records = parse_event_lines(decision_coverage, "decision coverage", errors);
+    let document_records = parse_event_lines(document_coverage, "document coverage", errors);
     let statuses: BTreeMap<String, String> = records
         .iter()
         .filter_map(|record| {
@@ -1154,51 +1160,82 @@ fn validate_reconstruction_audit(
         .unwrap_or_default();
     let allowed_files = inventory_file_paths(inventory, &analyzed_untracked, errors);
 
+    validate_document_audit(
+        inventory,
+        &document_records,
+        proposed_model,
+        candidates,
+        &candidates_by_id,
+        current_data,
+        &allowed_files,
+        errors,
+    );
+    let allowed_document_sources = if inventory.join("document-coverage.jsonl").exists() {
+        inventory_manifest_sources(inventory, "document-coverage.jsonl", errors)
+    } else {
+        BTreeSet::new()
+    };
+    let audited_document_paths: BTreeSet<String> = allowed_document_sources
+        .iter()
+        .filter_map(|source| {
+            document_source_path(source)
+                .or_else(|| {
+                    source
+                        .strip_prefix("file:")
+                        .filter(|path| !path.contains("#L"))
+                })
+                .map(str::to_owned)
+        })
+        .collect();
+
     let mut used_conversations = BTreeMap::new();
-    for event in candidates {
-        let id = event
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>");
-        validate_reconstruction_evidence(
-            &format!("candidate event '{id}'"),
-            event.get("evidence").and_then(Value::as_array),
-            &allowed_conversations,
-            &allowed_commits,
-            &allowed_files,
-            &mut used_conversations,
+    {
+        let mut evidence_scope = ReconstructionEvidenceScope {
+            conversations: &allowed_conversations,
+            commits: &allowed_commits,
+            files: &allowed_files,
+            document_paths: &audited_document_paths,
+            document_sources: &allowed_document_sources,
+            used_conversations: &mut used_conversations,
             errors,
-        );
-        validate_occurred_at_semantics(event, errors);
-    }
-    for section in ["principles", "architecture", "behaviors", "constraints"] {
-        for entry in proposed_model
-            .get(section)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if current_data
-                .model
-                .get(section)
-                .and_then(Value::as_array)
-                .is_some_and(|base_entries| base_entries.contains(entry))
-            {
-                continue;
-            }
-            let id = entry
+        };
+        for event in candidates {
+            let id = event
                 .get("id")
                 .and_then(Value::as_str)
                 .unwrap_or("<unknown>");
             validate_reconstruction_evidence(
-                &format!("model entry '{section}:{id}'"),
-                entry.get("evidence").and_then(Value::as_array),
-                &allowed_conversations,
-                &allowed_commits,
-                &allowed_files,
-                &mut used_conversations,
-                errors,
+                &format!("candidate event '{id}'"),
+                event.get("evidence").and_then(Value::as_array),
+                &mut evidence_scope,
             );
+            validate_occurred_at_semantics(event, evidence_scope.errors);
+        }
+        for section in ["principles", "architecture", "behaviors", "constraints"] {
+            for entry in proposed_model
+                .get(section)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if current_data
+                    .model
+                    .get(section)
+                    .and_then(Value::as_array)
+                    .is_some_and(|base_entries| base_entries.contains(entry))
+                {
+                    continue;
+                }
+                let id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                validate_reconstruction_evidence(
+                    &format!("model entry '{section}:{id}'"),
+                    entry.get("evidence").and_then(Value::as_array),
+                    &mut evidence_scope,
+                );
+            }
         }
     }
 
@@ -1304,6 +1341,463 @@ fn validate_reconstruction_audit(
             )),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_document_audit(
+    inventory: &Path,
+    records: &[Value],
+    proposed_model: &Value,
+    candidates: &[Value],
+    candidates_by_id: &BTreeMap<String, &Value>,
+    current_data: &RepositoryData,
+    allowed_files: &BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
+    let coverage_exists = inventory.join("document-coverage.jsonl").exists();
+    if !coverage_exists {
+        if !records.is_empty() {
+            errors
+                .push("document coverage records exist without a frozen coverage file".to_owned());
+        }
+        return;
+    }
+    let manifest = inventory_manifest_sources(inventory, "document-coverage.jsonl", errors);
+    let sources: BTreeSet<String> = records
+        .iter()
+        .filter_map(|record| record.get("source")?.as_str().map(str::to_owned))
+        .collect();
+    if sources.len() != records.len() || sources != manifest {
+        errors.push("document coverage sources do not match the frozen manifest".to_owned());
+    }
+    let frozen_sources = inventory_document_sources(inventory, errors);
+    if sources != frozen_sources {
+        errors.push("document coverage sources do not match frozen documents".to_owned());
+    }
+    let document_paths: BTreeSet<String> = sources
+        .iter()
+        .filter_map(|source| {
+            document_source_path(source)
+                .or_else(|| {
+                    source
+                        .strip_prefix("file:")
+                        .filter(|path| !path.contains("#L"))
+                })
+                .map(str::to_owned)
+        })
+        .collect();
+    for record in records {
+        let source = record.get("source").and_then(Value::as_str).unwrap_or("");
+        let status = record.get("status").and_then(Value::as_str).unwrap_or("");
+        let path = if status == "unavailable" {
+            source
+                .strip_prefix("file:")
+                .filter(|path| !path.is_empty() && !path.contains("#L"))
+        } else {
+            document_source_path(source)
+        };
+        let Some(path) = path else {
+            errors.push(format!(
+                "document coverage source '{source}' has an invalid line range"
+            ));
+            continue;
+        };
+        if !allowed_files.contains(path) {
+            errors.push(format!(
+                "document coverage source '{source}' is outside the frozen tracked paths"
+            ));
+        }
+        if matches!(status, "model" | "decision" | "attempt" | "recoverable")
+            && record
+                .get("topic")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("document {status} '{source}' has no topic"));
+        }
+        let owners = reconstruction_evidence_owners(source, proposed_model, candidates);
+        match status {
+            "model" => {
+                let mapping = record
+                    .get("candidate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let Some((section, id)) = valid_model_candidate(mapping) else {
+                    errors.push(format!(
+                        "document model '{source}' requires candidate section:id"
+                    ));
+                    continue;
+                };
+                let entry = proposed_model
+                    .get(section)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id));
+                let Some(entry) = entry else {
+                    errors.push(format!(
+                        "document model '{source}' references missing model entry '{mapping}'"
+                    ));
+                    continue;
+                };
+                let expected = normalize_whitespace(
+                    record
+                        .get("statement")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                let actual = normalize_whitespace(
+                    entry.get("statement").and_then(Value::as_str).unwrap_or(""),
+                );
+                if expected.is_empty() || expected != actual {
+                    errors.push(format!(
+                        "document model '{source}' statement differs from '{mapping}'"
+                    ));
+                }
+                let existing = current_data
+                    .model
+                    .get(section)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .any(|base| base == entry);
+                let expected_owner = format!("model:{mapping}");
+                if !existing && !owners.contains(&expected_owner) {
+                    errors.push(format!(
+                        "document source '{source}' is absent from '{mapping}' evidence"
+                    ));
+                }
+                if owners.iter().any(|owner| owner != &expected_owner) {
+                    errors.push(format!(
+                        "document source '{source}' is used outside '{mapping}'"
+                    ));
+                }
+            }
+            "decision" | "attempt" => {
+                let candidate = record
+                    .get("candidate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let Some(event) = candidates_by_id.get(candidate) else {
+                    errors.push(format!(
+                        "document {status} '{source}' references missing candidate '{candidate}'"
+                    ));
+                    continue;
+                };
+                if event.get("type").and_then(Value::as_str) != Some(status) {
+                    errors.push(format!(
+                        "document {status} '{source}' candidate '{candidate}' has another type"
+                    ));
+                }
+                let (record_field, event_field) = if status == "decision" {
+                    ("rationale", "reason")
+                } else {
+                    ("finding", "finding")
+                };
+                let expected = normalize_whitespace(
+                    record
+                        .get(record_field)
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+                let actual = normalize_whitespace(
+                    event.get(event_field).and_then(Value::as_str).unwrap_or(""),
+                );
+                if expected.is_empty() || expected != actual {
+                    errors.push(format!(
+                        "document {status} '{source}' {record_field} differs from '{candidate}'"
+                    ));
+                }
+                let expected_owner = format!("event:{candidate}");
+                if !owners.contains(&expected_owner) {
+                    errors.push(format!(
+                        "document source '{source}' is absent from '{candidate}' evidence"
+                    ));
+                }
+                if owners.iter().any(|owner| owner != &expected_owner) {
+                    errors.push(format!(
+                        "document source '{source}' is used outside '{candidate}'"
+                    ));
+                }
+            }
+            "recoverable" => {
+                let references = record.get("recovered_by").and_then(Value::as_array);
+                if references.is_none_or(Vec::is_empty) {
+                    errors.push(format!(
+                        "document recoverable '{source}' requires recovered_by references"
+                    ));
+                }
+                for reference in references.into_iter().flatten() {
+                    let Some(reference) = reference.as_str() else {
+                        errors.push(format!(
+                            "document recoverable '{source}' has a non-string reference"
+                        ));
+                        continue;
+                    };
+                    if let Some(file) = reference.strip_prefix("file:") {
+                        let path = file.split('#').next().unwrap_or(file);
+                        if !allowed_files.contains(path) {
+                            errors.push(format!(
+                                "document recoverable '{source}' uses file outside frozen inventory: '{path}'"
+                            ));
+                        } else if document_paths.contains(path) {
+                            errors.push(format!(
+                                "document recoverable '{source}' must cite code, tests, or schema rather than another audited document"
+                            ));
+                        } else if !recoverable_document_evidence_path(path) {
+                            errors.push(format!(
+                                "document recoverable '{source}' must cite current code, tests, or schema"
+                            ));
+                        }
+                    } else {
+                        errors.push(format!(
+                            "document recoverable '{source}' has unsupported ref '{reference}'"
+                        ));
+                    }
+                }
+                if !owners.is_empty() {
+                    errors.push(format!(
+                        "recoverable document source '{source}' is used as canonical evidence"
+                    ));
+                }
+            }
+            "excluded" | "unavailable" => {
+                if record
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+                {
+                    errors.push(format!("document {status} '{source}' has no reason"));
+                }
+                if !owners.is_empty() {
+                    errors.push(format!(
+                        "{status} document source '{source}' is used as canonical evidence"
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "document coverage source '{source}' has unresolved status '{status}'"
+            )),
+        }
+    }
+}
+
+fn inventory_document_sources(inventory: &Path, errors: &mut Vec<String>) -> BTreeSet<String> {
+    let path = inventory.join("documents.jsonl");
+    let Ok(content) = fs::read_to_string(&path) else {
+        errors.push(format!("cannot read frozen inventory {}", path.display()));
+        return BTreeSet::new();
+    };
+    let mut sources = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    for (index, line) in content.lines().enumerate() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            errors.push(format!(
+                "frozen inventory {}:{} is invalid JSON",
+                path.display(),
+                index + 1
+            ));
+            continue;
+        };
+        let Some(relative) = record.get("path").and_then(Value::as_str) else {
+            errors.push(format!(
+                "frozen inventory {}:{} has no document path",
+                path.display(),
+                index + 1
+            ));
+            continue;
+        };
+        if !paths.insert(relative.to_owned()) {
+            errors.push(format!("frozen documents duplicate path '{relative}'"));
+        }
+        if record.get("snapshot").is_none_or(Value::is_null) {
+            sources.insert(format!("file:{relative}"));
+            continue;
+        }
+        let Some(snapshot) = record.get("snapshot").and_then(Value::as_str) else {
+            errors.push(format!(
+                "frozen document '{relative}' has an invalid snapshot"
+            ));
+            continue;
+        };
+        let documents_root = inventory.join("documents");
+        let snapshot_path = inventory.join(snapshot);
+        let safe_snapshot = fs::canonicalize(&snapshot_path).ok().and_then(|path| {
+            fs::canonicalize(&documents_root)
+                .ok()
+                .filter(|root| path.starts_with(root))
+                .map(|_| path)
+        });
+        let Some(snapshot_path) = safe_snapshot else {
+            errors.push(format!(
+                "frozen document '{relative}' has an unsafe or missing snapshot"
+            ));
+            continue;
+        };
+        let Ok(bytes) = fs::read(&snapshot_path) else {
+            errors.push(format!("cannot read frozen document '{relative}'"));
+            continue;
+        };
+        if record.get("bytes").and_then(Value::as_u64) != Some(bytes.len() as u64) {
+            errors.push(format!("frozen document '{relative}' size changed"));
+        }
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if record.get("sha256").and_then(Value::as_str) != Some(digest.as_str()) {
+            errors.push(format!("frozen document '{relative}' digest changed"));
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            errors.push(format!("frozen document '{relative}' is not UTF-8"));
+            continue;
+        };
+        let expected_blocks = frozen_document_blocks(relative, text);
+        let Some(blocks) = record.get("blocks").and_then(Value::as_array) else {
+            errors.push(format!(
+                "frozen document '{relative}' has no block inventory"
+            ));
+            continue;
+        };
+        if blocks.len() != expected_blocks.len() {
+            errors.push(format!(
+                "frozen document '{relative}' block count differs from its snapshot"
+            ));
+        }
+        for (block, (expected_source, expected_start, expected_end)) in
+            blocks.iter().zip(expected_blocks)
+        {
+            let Some(source) = block.get("source").and_then(Value::as_str) else {
+                errors.push(format!(
+                    "frozen document '{relative}' has a block without source"
+                ));
+                continue;
+            };
+            if source != expected_source
+                || block.get("start").and_then(Value::as_u64) != Some(expected_start)
+                || block.get("end").and_then(Value::as_u64) != Some(expected_end)
+            {
+                errors.push(format!(
+                    "frozen document '{relative}' block metadata differs from its snapshot"
+                ));
+            }
+            if !sources.insert(source.to_owned()) {
+                errors.push(format!(
+                    "frozen documents duplicate block source '{source}'"
+                ));
+            }
+        }
+    }
+    sources
+}
+
+fn frozen_document_blocks(relative: &str, text: &str) -> Vec<(String, u64, u64)> {
+    let mut blocks = Vec::new();
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut start = None;
+    for (index, line) in lines.iter().enumerate() {
+        let line_number = index as u64 + 1;
+        if !line.trim().is_empty() {
+            start.get_or_insert(line_number);
+        } else if let Some(block_start) = start.take() {
+            let end = line_number - 1;
+            blocks.push((
+                format!("file:{relative}#L{block_start}-L{end}"),
+                block_start,
+                end,
+            ));
+        }
+    }
+    if let Some(block_start) = start {
+        let end = lines.len() as u64;
+        blocks.push((
+            format!("file:{relative}#L{block_start}-L{end}"),
+            block_start,
+            end,
+        ));
+    }
+    blocks
+}
+
+fn document_source_path(source: &str) -> Option<&str> {
+    let value = source.strip_prefix("file:")?;
+    let (path, range) = value.rsplit_once("#L")?;
+    let (start, end) = range.split_once("-L")?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    (!path.is_empty() && start > 0 && end >= start).then_some(path)
+}
+
+fn recoverable_document_evidence_path(relative: &str) -> bool {
+    let path = Path::new(relative);
+    let suffix = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{}", value.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let code_suffixes = [
+        ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt", ".kts",
+        ".lua", ".m", ".mm", ".php", ".py", ".rb", ".rs", ".scala", ".sh", ".swift", ".ts", ".tsx",
+        ".zig",
+    ];
+    if code_suffixes.contains(&suffix.as_str()) {
+        return true;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if file_name.ends_with(".schema.json") {
+        return true;
+    }
+    let parents: BTreeSet<String> = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let data_suffixes = [".json", ".jsonl", ".snap", ".toml", ".yaml", ".yml"];
+    if (parents.contains("test") || parents.contains("tests"))
+        && data_suffixes.contains(&suffix.as_str())
+    {
+        return true;
+    }
+    let schema_suffixes = [".json", ".proto", ".xsd", ".yaml", ".yml"];
+    (parents.contains("schema") || parents.contains("schemas"))
+        && schema_suffixes.contains(&suffix.as_str())
+}
+
+fn reconstruction_evidence_owners(
+    source: &str,
+    proposed_model: &Value,
+    candidates: &[Value],
+) -> BTreeSet<String> {
+    let mut owners = BTreeSet::new();
+    for candidate in candidates {
+        if has_evidence_ref(candidate, source) {
+            let id = candidate
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            owners.insert(format!("event:{id}"));
+        }
+    }
+    for section in ["principles", "architecture", "behaviors", "constraints"] {
+        for entry in proposed_model
+            .get(section)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if has_evidence_ref(entry, source) {
+                let id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                owners.insert(format!("model:{section}:{id}"));
+            }
+        }
+    }
+    owners
 }
 
 fn normalize_whitespace(value: &str) -> String {
@@ -1500,6 +1994,11 @@ fn validate_resolved_inventory_coverage(
         );
     }
     let include_untracked = include_untracked_value.unwrap_or(false);
+    let include_git_value = summary.pointer("/selected/git").and_then(Value::as_bool);
+    if include_git_value.is_none() {
+        errors.push("frozen inventory summary has no boolean Git selection".to_owned());
+    }
+    let include_git = include_git_value.unwrap_or(false);
     let mut specifications = vec![
         (
             "commit-coverage.jsonl",
@@ -1523,7 +2022,15 @@ fn validate_resolved_inventory_coverage(
     let decision_count = summary
         .pointer("/counts/decision_signals")
         .and_then(Value::as_u64);
-    if specifications.iter().any(|(_, count)| count.is_none()) || decision_count.is_none() {
+    let document_count = summary
+        .pointer("/counts/document_blocks")
+        .and_then(Value::as_u64);
+    let documents_count = summary.pointer("/counts/documents").and_then(Value::as_u64);
+    if specifications.iter().any(|(_, count)| count.is_none())
+        || decision_count.is_none()
+        || document_count.is_none()
+        || documents_count.is_none()
+    {
         errors.push("frozen inventory summary has missing coverage counts".to_owned());
     }
 
@@ -1538,14 +2045,19 @@ fn validate_resolved_inventory_coverage(
         ));
         return BTreeMap::new();
     };
-    if manifest.get("version").and_then(Value::as_u64) != Some(1) {
-        errors.push("frozen source manifest has an unsupported version".to_owned());
+    if manifest.get("version").and_then(Value::as_u64) != Some(2) {
+        errors.push(
+            "frozen source manifest has an unsupported version; recollect the inventory".to_owned(),
+        );
     }
-    let expected_names: BTreeSet<&str> = specifications
+    let mut expected_names: BTreeSet<&str> = specifications
         .iter()
         .map(|(name, _)| *name)
         .chain(std::iter::once("decision-coverage.jsonl"))
         .collect();
+    if include_git {
+        expected_names.insert("document-coverage.jsonl");
+    }
     let actual_names: BTreeSet<&str> = manifest
         .get("sources")
         .and_then(Value::as_object)
@@ -1637,6 +2149,93 @@ fn validate_resolved_inventory_coverage(
     if decision_lines != decision_count {
         errors
             .push("decision coverage count does not match the frozen inventory summary".to_owned());
+    }
+    if include_git {
+        let name = "document-coverage.jsonl";
+        let path = inventory.join(name);
+        let manifest_sources = inventory_manifest_sources(inventory, name, errors);
+        let content = fs::read_to_string(&path);
+        let Ok(content) = content else {
+            errors.push(format!("cannot read frozen coverage {}", path.display()));
+            return analyzed_by_file;
+        };
+        let mut sources = BTreeSet::new();
+        let mut resolved = BTreeSet::new();
+        let mut record_count = 0_u64;
+        for (index, line) in content.lines().enumerate() {
+            record_count += 1;
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                errors.push(format!(
+                    "frozen coverage {}:{} is invalid JSON",
+                    path.display(),
+                    index + 1
+                ));
+                continue;
+            };
+            let source = record.get("source").and_then(Value::as_str);
+            let status = record.get("status").and_then(Value::as_str);
+            if !matches!(
+                status,
+                Some("model" | "decision" | "attempt" | "recoverable" | "excluded" | "unavailable")
+            ) {
+                errors.push(format!(
+                    "frozen coverage {}:{} has unresolved status",
+                    path.display(),
+                    index + 1
+                ));
+            }
+            if matches!(status, Some("excluded" | "unavailable"))
+                && record
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            {
+                errors.push(format!(
+                    "frozen coverage {}:{} has no exclusion reason",
+                    path.display(),
+                    index + 1
+                ));
+            }
+            if let Some(source) = source {
+                if !sources.insert(source.to_owned()) {
+                    errors.push(format!(
+                        "frozen coverage {name} duplicates source '{source}'"
+                    ));
+                }
+                if matches!(
+                    status,
+                    Some("model" | "decision" | "attempt" | "recoverable")
+                ) {
+                    resolved.insert(source.to_owned());
+                }
+            } else {
+                errors.push(format!(
+                    "frozen coverage {}:{} has no source",
+                    path.display(),
+                    index + 1
+                ));
+            }
+        }
+        if sources != manifest_sources {
+            errors.push("frozen document coverage sources do not match the manifest".to_owned());
+        }
+        if Some(record_count) != document_count {
+            errors.push(
+                "document-coverage.jsonl count does not match the frozen inventory summary"
+                    .to_owned(),
+            );
+        }
+        let actual_documents = fs::read_to_string(inventory.join("documents.jsonl"))
+            .ok()
+            .map(|content| content.lines().count() as u64);
+        if actual_documents != documents_count {
+            errors.push(
+                "documents.jsonl count does not match the frozen inventory summary".to_owned(),
+            );
+        }
+        analyzed_by_file.insert(name.to_owned(), resolved);
+    } else if document_count != Some(0) {
+        errors.push("conversation-only inventory contains document blocks".to_owned());
     }
     analyzed_by_file
 }
@@ -1737,24 +2336,32 @@ fn validate_occurred_at_semantics(event: &Value, errors: &mut Vec<String>) {
     }
 }
 
+struct ReconstructionEvidenceScope<'a> {
+    conversations: &'a BTreeSet<String>,
+    commits: &'a BTreeSet<String>,
+    files: &'a BTreeSet<String>,
+    document_paths: &'a BTreeSet<String>,
+    document_sources: &'a BTreeSet<String>,
+    used_conversations: &'a mut BTreeMap<String, String>,
+    errors: &'a mut Vec<String>,
+}
+
 fn validate_reconstruction_evidence(
     label: &str,
     evidence: Option<&Vec<Value>>,
-    conversations: &BTreeSet<String>,
-    commits: &BTreeSet<String>,
-    files: &BTreeSet<String>,
-    used_conversations: &mut BTreeMap<String, String>,
-    errors: &mut Vec<String>,
+    scope: &mut ReconstructionEvidenceScope<'_>,
 ) {
     let mut accepted = 0;
     for item in evidence.into_iter().flatten() {
         let Some(reference) = evidence_reference(item) else {
-            errors.push(format!("{label} has evidence without a ref"));
+            scope
+                .errors
+                .push(format!("{label} has evidence without a ref"));
             continue;
         };
         if reference.starts_with("conversation:") {
-            if !conversations.contains(reference) {
-                errors.push(format!(
+            if !scope.conversations.contains(reference) {
+                scope.errors.push(format!(
                     "{label} uses conversation evidence outside the frozen inventory: '{reference}'"
                 ));
             } else {
@@ -1765,17 +2372,18 @@ fn validate_reconstruction_evidence(
             } else {
                 "event"
             };
-            if let Some(previous) =
-                used_conversations.insert(reference.to_owned(), owner.to_owned())
+            if let Some(previous) = scope
+                .used_conversations
+                .insert(reference.to_owned(), owner.to_owned())
                 && previous != owner
             {
-                errors.push(format!(
+                scope.errors.push(format!(
                     "conversation evidence '{reference}' is used by both event and model candidates"
                 ));
             }
         } else if let Some(commit) = reference.strip_prefix("commit:") {
-            if !commits.contains(commit) {
-                errors.push(format!(
+            if !scope.commits.contains(commit) {
+                scope.errors.push(format!(
                     "{label} uses commit outside the frozen inventory: '{commit}'"
                 ));
             } else {
@@ -1783,21 +2391,27 @@ fn validate_reconstruction_evidence(
             }
         } else if let Some(file) = reference.strip_prefix("file:") {
             let path = file.split('#').next().unwrap_or(file);
-            if !files.contains(path) {
-                errors.push(format!(
+            if !scope.files.contains(path) {
+                scope.errors.push(format!(
                     "{label} uses file outside the frozen inventory: '{path}'"
+                ));
+            } else if scope.document_paths.contains(path)
+                && !scope.document_sources.contains(reference)
+            {
+                scope.errors.push(format!(
+                    "{label} uses a document reference outside the frozen block inventory: '{reference}'"
                 ));
             } else {
                 accepted += 1;
             }
         } else {
-            errors.push(format!(
+            scope.errors.push(format!(
                 "{label} has unsupported evidence ref '{reference}'"
             ));
         }
     }
     if accepted == 0 {
-        errors.push(format!(
+        scope.errors.push(format!(
             "{label} requires at least one analyzed frozen-inventory evidence item"
         ));
     }
@@ -3546,6 +4160,174 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("statement conflicts"))
         );
+    }
+
+    #[test]
+    fn reconstruction_requires_every_document_model_candidate_without_persisting_inventory() {
+        let directory = initialized();
+        let temporary = TempDir::new().expect("temporary reconstruction inputs");
+        let project = directory.path().join(".project-context");
+        let base_model = temporary.path().join("base-model.yaml");
+        let base_events = temporary.path().join("base-events.jsonl");
+        fs::copy(project.join("model.yaml"), &base_model).expect("copy base model");
+        fs::copy(project.join("events.jsonl"), &base_events).expect("copy base events");
+        let inventory = temporary.path().join("inventory");
+        fs::create_dir(&inventory).expect("inventory directory");
+        write(
+            &inventory.join("summary.json"),
+            r#"{"selected":{"git":true,"conversations":false,"non_ignored_untracked":false},"counts":{"commits":0,"conversation_records":0,"decision_signals":0,"documents":2,"document_blocks":4}}"#,
+        );
+        write(
+            &inventory.join("coverage-sources.json"),
+            r#"{"version":2,"sources":{"commit-coverage.jsonl":[],"conversation-coverage.jsonl":[],"decision-coverage.jsonl":[],"document-coverage.jsonl":["file:SPEC.md#L1-L1","file:SPEC.md#L3-L3","file:SPEC.md#L5-L5","file:binary.txt"]}}"#,
+        );
+        for name in [
+            "commits.jsonl",
+            "commit-coverage.jsonl",
+            "conversation-coverage.jsonl",
+            "decision-coverage.jsonl",
+        ] {
+            write(&inventory.join(name), "");
+        }
+        write(
+            &inventory.join("tracked-paths.json"),
+            "[\"SPEC.md\",\"binary.txt\",\"src/lib.rs\"]\n",
+        );
+        write(
+            &inventory.join("document-coverage.jsonl"),
+            concat!(
+                "{\"source\":\"file:SPEC.md#L1-L1\",\"status\":\"model\",\"topic\":\"thought flow\",\"candidate\":\"principles:sentence-thought-flow\",\"statement\":\"Enter complete mixed-language thoughts.\"}\n",
+                "{\"source\":\"file:SPEC.md#L3-L3\",\"status\":\"model\",\"topic\":\"MVP boundary\",\"candidate\":\"constraints:explicit-mvp-exclusions\",\"statement\":\"Keep background deep context outside the MVP.\"}\n",
+                "{\"source\":\"file:SPEC.md#L5-L5\",\"status\":\"model\",\"topic\":\"routing priority\",\"candidate\":\"principles:latency-first-routing\",\"statement\":\"Prioritize response latency when routing providers.\"}\n",
+                "{\"source\":\"file:binary.txt\",\"status\":\"unavailable\",\"reason\":\"document is not UTF-8\"}\n",
+            ),
+        );
+        let documents = inventory.join("documents");
+        fs::create_dir(&documents).expect("document snapshots");
+        let specification = concat!(
+            "Enter complete mixed-language thoughts.\n\n",
+            "Keep background deep context outside the MVP.\n\n",
+            "Prioritize response latency when routing providers.\n",
+        );
+        write(&documents.join("spec.txt"), specification);
+        let document_record = json!({
+            "path": "SPEC.md",
+            "snapshot": "documents/spec.txt",
+            "bytes": specification.len(),
+            "sha256": format!("{:x}", Sha256::digest(specification.as_bytes())),
+            "blocks": [
+                {"source": "file:SPEC.md#L1-L1", "start": 1, "end": 1},
+                {"source": "file:SPEC.md#L3-L3", "start": 3, "end": 3},
+                {"source": "file:SPEC.md#L5-L5", "start": 5, "end": 5}
+            ]
+        });
+        write(
+            &inventory.join("documents.jsonl"),
+            &format!("{document_record}\n{{\"path\":\"binary.txt\",\"snapshot\":null}}\n"),
+        );
+        let proposed_model = temporary.path().join("proposed-model.yaml");
+        let proposed_events = temporary.path().join("proposed-events.jsonl");
+        write(&proposed_events, "");
+        let base_text = fs::read_to_string(&base_model).expect("base model text");
+        let mut proposed = yaml_to_json(&base_text, "base model").expect("parse base model");
+        proposed["principles"] = json!([
+            {
+                "id": "sentence-thought-flow",
+                "statement": "Enter complete mixed-language thoughts.",
+                "evidence": [{"ref": "file:SPEC.md#L1-L1", "role": "context"}]
+            },
+            {
+                "id": "latency-first-routing",
+                "statement": "Prioritize response latency when routing providers.",
+                "evidence": [{"ref": "file:SPEC.md#L5-L5", "role": "context"}]
+            }
+        ]);
+        proposed["constraints"] = json!([]);
+        write(
+            &proposed_model,
+            &serde_yaml_ng::to_string(&proposed).expect("serialize incomplete model"),
+        );
+        let input = || ReconstructionInput {
+            base_model: base_model.clone(),
+            base_events: base_events.clone(),
+            model: proposed_model.clone(),
+            events: proposed_events.clone(),
+            inventory: inventory.clone(),
+        };
+        let error = check_reconstruction(directory.path(), input())
+            .expect_err("missing document candidate must fail");
+        assert!(matches!(
+            error,
+            StoreError::Invalid(report)
+                if report.errors.iter().any(|item| item.contains("explicit-mvp-exclusions"))
+        ));
+
+        proposed["constraints"] = json!([{
+            "id": "explicit-mvp-exclusions",
+            "statement": "Keep background deep context outside the MVP.",
+            "evidence": [{"ref": "file:SPEC.md#L1-L1", "role": "context"}]
+        }]);
+        write(
+            &proposed_model,
+            &serde_yaml_ng::to_string(&proposed).expect("serialize wrong-evidence model"),
+        );
+        let error = check_reconstruction(directory.path(), input())
+            .expect_err("wrong document evidence must fail");
+        assert!(matches!(
+            error,
+            StoreError::Invalid(report)
+                if report.errors.iter().any(|item| item.contains("absent from 'constraints:explicit-mvp-exclusions'"))
+        ));
+        proposed["constraints"][0]["evidence"] =
+            json!([{"ref": "file:SPEC.md#L3-L3", "role": "context"}]);
+        write(
+            &proposed_model,
+            &serde_yaml_ng::to_string(&proposed).expect("serialize complete model"),
+        );
+        write(&documents.join("spec.txt"), "tampered\n");
+        let error = check_reconstruction(directory.path(), input())
+            .expect_err("tampered document snapshot must fail");
+        assert!(matches!(
+            error,
+            StoreError::Invalid(report)
+                if report.errors.iter().any(|item| item.contains("digest changed"))
+        ));
+        write(&documents.join("spec.txt"), specification);
+        proposed["principles"][0]["evidence"]
+            .as_array_mut()
+            .expect("model evidence")
+            .push(json!({"ref": "file:SPEC.md#L999-L999", "role": "context"}));
+        write(
+            &proposed_model,
+            &serde_yaml_ng::to_string(&proposed).expect("serialize invented-evidence model"),
+        );
+        let error = check_reconstruction(directory.path(), input())
+            .expect_err("invented document block must fail");
+        assert!(matches!(
+            error,
+            StoreError::Invalid(report)
+                if report.errors.iter().any(|item| item.contains("outside the frozen block inventory"))
+        ));
+        proposed["principles"][0]["evidence"]
+            .as_array_mut()
+            .expect("model evidence")
+            .pop();
+        write(
+            &proposed_model,
+            &serde_yaml_ng::to_string(&proposed).expect("restore complete model"),
+        );
+        let schema_before = fs::read(project.join("schemas/model.schema.json"))
+            .expect("schema before reconstruction");
+        assert!(check_reconstruction(directory.path(), input()).is_ok());
+        let report = apply_reconstruction(directory.path(), input()).expect("apply reconstruction");
+        assert!(report.model_changed);
+        assert_eq!(
+            fs::read(project.join("schemas/model.schema.json"))
+                .expect("schema after reconstruction"),
+            schema_before
+        );
+        assert!(!project.join("documents.jsonl").exists());
+        assert!(!project.join("document-coverage.jsonl").exists());
     }
 
     #[test]

@@ -40,3 +40,16 @@ Ignored files remain excluded even when untracked files are selected. Report abs
 ## Frozen inventory
 
 Record selected refs, commit IDs, conversation provider/session IDs, record counts, and optional-source flags at collection start. If those source identities change during analysis, report the change and restart from a new base instead of mixing snapshots.
+
+## Tracked documentation
+
+When Git is selected, freeze current tracked documentation from `HEAD` without reading tracked
+worktree contents. If tracked worktree changes were explicitly selected, freeze the corresponding
+filesystem content and retain the existing worktree concurrency check. Exclude canonical Project
+Context paths before reading any content.
+
+Audit UTF-8 documents up to 2 MiB with Markdown, reStructuredText, AsciiDoc, or text suffixes, plus
+conventional extensionless README, SPEC, DESIGN, ARCHITECTURE, DECISIONS, and ROADMAP files. Split
+them into non-empty blocks at blank lines. Record non-UTF-8, oversized, missing, or non-regular
+documents as unavailable. Snapshots and block manifests are private temporary inventory data and
+must never be copied into the repository.

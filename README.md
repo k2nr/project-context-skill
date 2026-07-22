@@ -184,6 +184,14 @@ snapshots remain opaque until the final preservation merge. A separate
 direct-user decision audit must also pass before apply, so ordinary source
 coverage cannot conceal missed accepted proposals or reason-qualified choices.
 
+When Git is selected, reconstruction also freezes tracked documentation from `HEAD`, or from the
+tracked worktree only when that optional source was approved. Every non-empty document block must be
+classified as model intent, a decision, an attempt, recoverable from code/tests/schema, excluded, or
+unavailable. Both the side-effect-free check and transactional apply reject unresolved blocks,
+missing candidates, unsupported recovery evidence, and document evidence used by the wrong
+candidate. Document snapshots and coverage manifests are temporary private inventory data; the
+feature adds no persistent repository files and does not change the canonical store layout.
+
 Packages produced from this source contain exactly the two top-level skill
 directories. Installation accepts only fresh, additive-companion, or fully
 identical states. If either installed skill differs from the verified package,

@@ -17,11 +17,22 @@ git -C "$fixture" init -q -b master
 git -C "$fixture" config user.name Fixture
 git -C "$fixture" config user.email fixture@example.invalid
 printf 'first\n' > "${fixture}/source.txt"
+printf '%s\n\n%s\n\n%s\n' \
+  'Enter complete mixed-language thoughts without repeated phrase selection.' \
+  'Local models, general onboarding, and background deep context are intentionally outside the MVP.' \
+  'Provider routing prioritizes response latency.' \
+  > "${fixture}/SPEC.md"
+mkdir -p "${fixture}/src"
+printf 'pub const ROUTING: &str = "latency";\n' > "${fixture}/src/lib.rs"
+printf 'lock data\n' > "${fixture}/Cargo.lock"
+printf '\377\376\000' > "${fixture}/binary.txt"
+python3 -c 'import sys; sys.stdout.write("x" * (2 * 1024 * 1024 + 1))' \
+  > "${fixture}/oversized.txt"
 printf 'ignored.log\n' > "${fixture}/.gitignore"
 mkdir -p "${fixture}/.project-context"
 printf 'historical-model-must-not-be-materialized\n' > "${fixture}/.project-context/model.yaml"
 printf 'historical-events-must-not-be-materialized\n' > "${fixture}/.project-context/events.jsonl"
-git -C "$fixture" add source.txt .gitignore .project-context
+git -C "$fixture" add source.txt SPEC.md src/lib.rs Cargo.lock binary.txt oversized.txt .gitignore .project-context
 git -C "$fixture" commit -qm 'Add source'
 git -C "$fixture" tag initial
 git -C "$fixture" checkout -qb topic
@@ -42,6 +53,7 @@ unreachable=$(git -C "$fixture" rev-parse HEAD)
 git -C "$fixture" reset -q --hard HEAD~1
 git -C "$fixture" reflog expire --expire=now --all
 printf 'worktree\n' >> "${fixture}/renamed.txt"
+printf '\nWorktree-only specification text.\n' >> "${fixture}/SPEC.md"
 printf 'current-model-must-not-be-materialized\n' > "${fixture}/.project-context/model.yaml"
 printf 'untracked\n' > "${fixture}/visible.txt"
 printf 'ignored\n' > "${fixture}/ignored.log"
@@ -147,6 +159,12 @@ grep -Fq '"status":"unavailable"' "${inventory}/conversation-coverage.jsonl"
 grep -Fq 'conversation:codex:codex-related#1' "${inventory}/decision-coverage.jsonl"
 grep -Fq 'canonical-context-artifact-redacted' "${inventory}/conversations.jsonl"
 grep -Fq 'visible.txt' "${inventory}/untracked.jsonl"
+grep -Fq 'file:SPEC.md#L1-L1' "${inventory}/document-coverage.jsonl"
+grep -Fq 'file:SPEC.md#L3-L3' "${inventory}/document-coverage.jsonl"
+grep -Fq 'file:SPEC.md#L5-L5' "${inventory}/document-coverage.jsonl"
+grep -Fq 'file:SPEC.md#L7-L7' "${inventory}/document-coverage.jsonl"
+grep -Fq 'document is not UTF-8' "${inventory}/document-coverage.jsonl"
+grep -Fq 'oversized document' "${inventory}/document-coverage.jsonl"
 if grep -Fq 'ignored.log' "${inventory}/untracked.jsonl"; then
   printf 'ignored file was included in reconstruction inventory\n' >&2
   exit 1
@@ -169,6 +187,8 @@ assert all(
     for segment in session["frozen_segments"]
 )
 assert summary["counts"]["decision_signals"] == 2
+assert summary["counts"]["documents"] >= 2
+assert summary["counts"]["document_blocks"] >= 3
 tracked = json.loads((root / "tracked-paths.json").read_text())
 assert ".project-context/model.yaml" not in tracked
 assert ".project-context/events.jsonl" not in tracked
@@ -200,9 +220,95 @@ for record in records:
     record["rationale"] = "Target repositories must not need build tools."
     record["candidate"] = "candidate:local-dependency"
 path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
+path = root / "document-coverage.jsonl"
+records = [json.loads(line) for line in path.read_text().splitlines()]
+model = {
+    "file:SPEC.md#L1-L1": ("principles:sentence-thought-flow", "Enter complete mixed-language thoughts without repeated phrase selection."),
+    "file:SPEC.md#L3-L3": ("constraints:explicit-mvp-exclusions", "Local models, general onboarding, and background deep context are intentionally outside the MVP."),
+    "file:SPEC.md#L5-L5": ("principles:latency-first-routing", "Provider routing prioritizes response latency."),
+}
+for record in records:
+    if record["source"] in model:
+        record["status"] = "model"
+        record["topic"] = "durable specification intent"
+        record["candidate"], record["statement"] = model[record["source"]]
+    elif record["source"].startswith("file:renamed.txt#"):
+        record["status"] = "recoverable"
+        record["topic"] = "fixture implementation"
+        record["recovered_by"] = ["file:src/lib.rs"]
+    else:
+        record["status"] = "excluded"
+        record["reason"] = "Fixture prose with no durable project intent."
+path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
 PY
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
   verify-coverage --inventory "$inventory" >/dev/null
+spec_snapshot=$(python3 - "$inventory" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+records = [json.loads(line) for line in (root / "documents.jsonl").read_text().splitlines()]
+print(next(record["snapshot"] for record in records if record["path"] == "SPEC.md"))
+PY
+)
+cp "${inventory}/${spec_snapshot}" "${inventory}/${spec_snapshot}.before"
+printf 'tampered\n' >> "${inventory}/${spec_snapshot}"
+set +e
+HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+  verify-coverage --inventory "$inventory" >/dev/null 2>&1
+tampered_document_status=$?
+set -e
+[ "$tampered_document_status" -eq 2 ]
+mv "${inventory}/${spec_snapshot}.before" "${inventory}/${spec_snapshot}"
+cp "${inventory}/document-coverage.jsonl" "${inventory}/document-coverage.before"
+python3 - "$inventory" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1]) / "document-coverage.jsonl"
+records = [json.loads(line) for line in path.read_text().splitlines()]
+record = next(item for item in records if item["source"] == "file:SPEC.md#L1-L1")
+record.clear()
+record.update({
+    "source": "file:SPEC.md#L1-L1",
+    "status": "recoverable",
+    "topic": "thought flow",
+    "recovered_by": [],
+})
+path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
+PY
+set +e
+HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+  verify-coverage --inventory "$inventory" >/dev/null 2>&1
+missing_recovery_status=$?
+set -e
+[ "$missing_recovery_status" -eq 2 ]
+python3 - "$inventory" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1]) / "document-coverage.jsonl"
+records = [json.loads(line) for line in path.read_text().splitlines()]
+record = next(item for item in records if item["source"] == "file:SPEC.md#L1-L1")
+record["recovered_by"] = ["file:src/missing.rs"]
+path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
+PY
+set +e
+HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+  verify-coverage --inventory "$inventory" >/dev/null 2>&1
+unfrozen_recovery_status=$?
+set -e
+[ "$unfrozen_recovery_status" -eq 2 ]
+python3 - "$inventory" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1]) / "document-coverage.jsonl"
+records = [json.loads(line) for line in path.read_text().splitlines()]
+record = next(item for item in records if item["source"] == "file:SPEC.md#L1-L1")
+record["recovered_by"] = ["file:Cargo.lock"]
+path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
+PY
+set +e
+HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+  verify-coverage --inventory "$inventory" >/dev/null 2>&1
+non_source_recovery_status=$?
+set -e
+[ "$non_source_recovery_status" -eq 2 ]
+mv "${inventory}/document-coverage.before" "${inventory}/document-coverage.jsonl"
 candidate_events="${test_root}/candidate-events.jsonl"
 : > "$candidate_events"
 set +e
@@ -216,6 +322,21 @@ printf '%s\n' \
   > "$candidate_events"
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
   verify-candidates --inventory "$inventory" --events "$candidate_events" >/dev/null
+cp "$candidate_events" "${candidate_events}.before"
+python3 - "$candidate_events" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+event = json.loads(path.read_text())
+event["evidence"].append({"ref": "file:SPEC.md#L999-L999", "role": "context"})
+path.write_text(json.dumps(event) + "\n")
+PY
+set +e
+HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
+  verify-candidates --inventory "$inventory" --events "$candidate_events" >/dev/null 2>&1
+invented_document_status=$?
+set -e
+[ "$invented_document_status" -eq 2 ]
+mv "${candidate_events}.before" "$candidate_events"
 cp "${inventory}/conversation-coverage.jsonl" "${inventory}/conversation-coverage.before"
 python3 - "$inventory" <<'PY'
 import json, pathlib, sys
@@ -236,24 +357,29 @@ git_only="${test_root}/git-only"
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
   collect --root "$fixture" --output "$git_only" --include-git >/dev/null
 python3 - "$git_only/summary.json" <<'PY'
-import json, sys
+import json, pathlib, sys
 summary = json.load(open(sys.argv[1]))
 assert summary["selected"]["git"] is True
 assert summary["selected"]["conversations"] is False
 assert summary["sessions"] == []
 assert summary["counts"]["conversation_records"] == 0
+assert summary["counts"]["document_blocks"] >= 3
+coverage = open(pathlib.Path(sys.argv[1]).parent / "document-coverage.jsonl").read()
+assert "file:SPEC.md#L7-L7" not in coverage
 PY
 
 conversation_only="${test_root}/conversation-only"
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
   collect --root "$fixture" --output "$conversation_only" --include-conversations >/dev/null
 python3 - "$conversation_only/summary.json" <<'PY'
-import json, sys
+import json, pathlib, sys
 summary = json.load(open(sys.argv[1]))
 assert summary["selected"]["git"] is False
 assert summary["selected"]["conversations"] is True
 assert summary["counts"]["commits"] == 0
 assert summary["counts"]["tracked_paths"] == 0
+assert summary["counts"]["document_blocks"] == 0
+assert not (pathlib.Path(sys.argv[1]).parent / "document-coverage.jsonl").exists()
 PY
 
 mutation_inventory="${test_root}/mutation-inventory"

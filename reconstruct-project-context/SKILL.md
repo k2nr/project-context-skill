@@ -47,7 +47,27 @@ Never infer consent from invoking this skill. Skip the question only when the us
    ```
 
    Omit either base-source flag unless that source was approved. Treat the selected Git and conversation source list in `summary.json` as frozen for this run.
-6. Review history in two passes: first chronologically classify every `pending` commit,
+   When Git is selected, collection also freezes tracked documentation from `HEAD`; it reads the
+   tracked worktree version only when `--include-worktree` was approved. Documentation snapshots,
+   block coverage, and manifests remain inside the private temporary directory and are never
+   canonical Project Context files.
+6. Classify every entry in `document-coverage.jsonl` before constructing candidates. Collection
+   creates one source per non-empty, blank-line-delimited block in tracked Markdown,
+   reStructuredText, AsciiDoc, text, and conventional README/SPEC/DESIGN/ARCHITECTURE/DECISIONS/ROADMAP
+   files. Resolve each block as exactly one of:
+
+   - `model`: current durable intent, with `topic`, canonical `statement`, and `candidate` as `section:id`;
+   - `decision`: an explicit choice and reason, with `topic`, `rationale`, and a `candidate:` Decision;
+   - `attempt`: a reusable experiment outcome, with `topic`, `finding`, and a `candidate:` Attempt;
+   - `recoverable`: content recoverable from current code, tests, or schemas, with `topic` and one or
+     more frozen code, test, or schema `file:` references in `recovered_by`;
+   - `excluded` or `unavailable`, with a specific `reason`.
+
+   A tracked document cannot be used as its own `recoverable` evidence. Do not summarize a whole
+   file as covered when one block remains `pending`. Candidate events must cite the exact block
+   source. New model entries must cite it; an unchanged base model entry may satisfy the block only
+   when its normalized statement exactly matches the independently extracted statement.
+7. Review the remaining history in two passes: first chronologically classify every `pending` commit,
    conversation record, and selected untracked file; then inspect relevant topics in depth. Change
    every ordinary coverage item to `analyzed`, `excluded`, or `unavailable`, with a reason for the
    latter two.
@@ -72,7 +92,7 @@ Never infer consent from invoking this skill. Skip the question only when the us
    ```
 
    Do not construct candidates unless verification succeeds.
-7. Build the complete independent candidate set from approved evidence, without consulting the base
+8. Build the complete independent candidate set from approved evidence, without consulting the base
    model or base events. Follow the qualification rules exactly. Write the proposed integrated model
    only after candidate extraction is complete, using the opaque base solely as a preservation
    boundary. Write candidate events from oldest to newest; within one date, preserve the order in
@@ -92,7 +112,7 @@ Never infer consent from invoking this skill. Skip the question only when the us
    ```
 
    A passing record-coverage check is not a candidate-completeness check; both commands must pass.
-8. Run the complete side-effect-free gate, then apply through the same validation path:
+9. Run the complete side-effect-free gate, then apply through the same validation path:
 
    ```sh
    project-context check-reconstruction \
@@ -110,7 +130,10 @@ Never infer consent from invoking this skill. Skip the question only when the us
      --inventory "$temporary/inventory"
    ```
 
-9. Report selected sources, coverage counts, additions, duplicates, conflicts, unavailable sources, and contradictions preserved in the base model. Delete the temporary directory on success, failure, or interruption.
+10. Report selected sources, record and document-block coverage counts, additions, duplicates,
+    conflicts, unavailable sources, and contradictions preserved in the base model. Delete the
+    temporary directory on success, failure, or interruption. Reconstruction adds no persistent
+    inventory or coverage files; it changes only the existing canonical model and event targets.
 
 ## Hard constraints
 
@@ -120,6 +143,7 @@ Never infer consent from invoking this skill. Skip the question only when the us
   `.project-context/events.jsonl` content as evidence. The inventory removes those Git paths and
   redacts non-user conversation records that materialize them.
 - Never save transcript text, secrets, absolute transcript paths, routine failures, or inferred rationale in canonical data.
+- Never persist document snapshots, coverage files, or inventory manifests in the repository.
 - Express conversation evidence only as `conversation:<provider>:<session-id>#<record-index>`.
 - Treat CLI exit 3 as a base-state conflict. Do not retry against a new base without reporting the conflict and re-evaluating the candidates.
 - Do not change versions, tags, releases, published assets, or installed skill contents.
