@@ -28,12 +28,12 @@ case "$machine_name" in
 esac
 
 target="${target_arch}-${target_system}"
-asset_name="project-context-v0.3.0-${target}"
+asset_name="project-context-v0.4.0-${target}"
 
 create_release() {
   release_root=$1
   fixture_label=$2
-  release_directory="${release_root}/v0.3.0"
+  release_directory="${release_root}/v0.4.0"
   mkdir -p "$release_directory"
   fixture_binary="${release_directory}/${asset_name}"
   # shellcheck disable=SC2016 # The generated fixture must expand its own arguments.
@@ -68,7 +68,7 @@ set -e
 [ "$missing_status" -eq 2 ]
 printf '%s\n' "$missing_output" | grep -q 'download failed'
 
-fixture_a="${release_a}/v0.3.0/${asset_name}"
+fixture_a="${release_a}/v0.4.0/${asset_name}"
 cp "${fixture_a}.sha256" "${fixture_a}.sha256.valid"
 printf '%064d\n' 0 > "${fixture_a}.sha256"
 set +e
@@ -127,7 +127,7 @@ output=$(
 [ "$output" = 'fixture-a:init --format json' ]
 printf '%s\n' "$lower_checksum" > "${fixture_a}.sha256"
 
-mv "${release_a}/v0.3.0" "${release_a}/v0.3.0.offline"
+mv "${release_a}/v0.4.0" "${release_a}/v0.4.0.offline"
 cached_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
   PROJECT_CONTEXT_RELEASE_BASE_URL="file://${release_a}" \
@@ -135,11 +135,11 @@ cached_output=$(
   "$launcher" validate
 )
 [ "$cached_output" = 'fixture-a:validate' ]
-mv "${release_a}/v0.3.0.offline" "${release_a}/v0.3.0"
+mv "${release_a}/v0.4.0.offline" "${release_a}/v0.4.0"
 
-printf '%s\n' '#!/bin/sh' 'printf "corrupt-cache-ran\n"' > "${test_root}/cache/v0.3.0/${target}/project-context"
-chmod 700 "${test_root}/cache/v0.3.0/${target}/project-context"
-mv "${release_a}/v0.3.0" "${release_a}/v0.3.0.offline"
+printf '%s\n' '#!/bin/sh' 'printf "corrupt-cache-ran\n"' > "${test_root}/cache/v0.4.0/${target}/project-context"
+chmod 700 "${test_root}/cache/v0.4.0/${target}/project-context"
+mv "${release_a}/v0.4.0" "${release_a}/v0.4.0.offline"
 set +e
 corrupt_offline_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
@@ -155,7 +155,7 @@ if printf '%s\n' "$corrupt_offline_output" | grep -q 'corrupt-cache-ran'; then
   printf 'corrupt cached binary unexpectedly executed\n' >&2
   exit 1
 fi
-mv "${release_a}/v0.3.0.offline" "${release_a}/v0.3.0"
+mv "${release_a}/v0.4.0.offline" "${release_a}/v0.4.0"
 repaired_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \
   PROJECT_CONTEXT_RELEASE_BASE_URL="file://${release_a}" \
@@ -164,7 +164,7 @@ repaired_output=$(
 )
 [ "$repaired_output" = 'fixture-a:validate' ]
 
-cached_checksum="${test_root}/cache/v0.3.0/${target}/project-context.sha256"
+cached_checksum="${test_root}/cache/v0.4.0/${target}/project-context.sha256"
 : > "$cached_checksum"
 recovered_output=$(
   PROJECT_CONTEXT_BOOTSTRAP_TESTING=1 \

@@ -38,8 +38,10 @@ pub fn render_configure(report: &ConfigureReport, format: OutputFormat) -> Strin
 pub fn render_migrate(report: &MigrateReport, format: OutputFormat) -> String {
     match format {
         OutputFormat::Text => format!(
-            "migration {}\nmodel migrated: {}\nevents migrated: {}\nschemas updated: {}",
+            "migration {}\nfrom version: {}\nto version: {}\nmodel migrated: {}\nevents migrated: {}\nschemas updated: {}",
             if report.no_op { "unchanged" } else { "applied" },
+            report.from_version,
+            report.to_version,
             report.model_migrated,
             report.events_migrated,
             report.schemas_updated

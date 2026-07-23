@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:project-context:model:3",
+  "$id": "urn:project-context:model:2",
   "title": "Project Context Model",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "project", "principles", "architecture", "behaviors", "constraints", "operations", "extensions"],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 2 },
     "project": {
       "type": "object",
       "additionalProperties": false,

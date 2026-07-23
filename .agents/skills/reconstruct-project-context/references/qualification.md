@@ -18,9 +18,10 @@ authorized from-scratch reconstruction, initialize an empty canonical store befo
 Record coverage proves only that every source received a disposition. It does not prove that every
 important choice was extracted. Classify every direct-user entry in `decision-coverage.jsonl`, trace
 short approvals and corrections to the surrounding proposal and rationale, and run
-`verify-candidates` before apply. Every entry classified as `decision` must appear in candidate event
-evidence through its declared `candidate:` ID, and its `rationale` must equal that candidate
-Decision's reason after whitespace normalization. Do not downgrade an explicit choice to `model`
+`verify-candidates` before apply. Every entry classified as `decision` or `attempt` must appear in
+candidate event evidence through its declared `candidate:` ID. Its `rationale` or `finding` must
+equal the candidate reason or finding after whitespace normalization. Do not downgrade an explicit
+choice to `model`
 merely because the selected implementation is recoverable from code; the unrecoverable reason still
 belongs in a Decision.
 
@@ -28,9 +29,11 @@ Independently classify every frozen tracked-document block. A commit-level `anal
 not prove that every durable statement in a specification was extracted. A `recoverable` block must
 cite current code, tests, or schemas from the frozen inventory; another audited
 document is not recovery evidence. Document `decision` and `attempt` records must map to matching
-candidate events with exact block evidence and matching rationale or finding. A document `model`
-record must map to an exact normalized statement in the proposed model; new entries cite the block,
-while an unchanged base entry may satisfy the record only after independent candidate extraction.
+candidate events with matching rationale or finding. A document `model` record must map to an exact
+normalized statement in the proposed model. Canonical candidates never cite the document block.
+Their `supported_by` evidence must cite every frozen origin commit for the block's non-empty lines,
+or a frozen direct-user signal mapped to the same candidate. An uncommitted worktree line without
+matching direct-user evidence remains unresolved and blocks apply.
 
 ## Decisions
 
@@ -44,6 +47,7 @@ Create an attempt only for a non-obvious or costly experiment whose result is re
 
 - Git evidence uses durable commit or repository-relative file references supported by project-context.
 - Conversation evidence uses `conversation:<provider>:<session-id>#<record-index>` only.
+- Tracked documentation is an audit input, never canonical evidence.
 - Paraphrase the durable conclusion. Never copy transcript passages.
 - Omit credentials, tokens, personal data, generated logs, and secret-shaped values.
 - Record evidence as objects with `ref`; add `role` and `observed_at` only when explicit.

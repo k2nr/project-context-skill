@@ -6,6 +6,16 @@ repository_root=$(
   cd -- "$(dirname -- "$0")/.."
   pwd
 )
+PYTHONDONTWRITEBYTECODE=1 python3 - "$repository_root" <<'PY'
+import importlib.util, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+path = root / "reconstruct-project-context/scripts/inventory_local_history.py"
+spec = importlib.util.spec_from_file_location("inventory_local_history", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+for case in json.loads((root / "tests/fixtures/document-paths.json").read_text()):
+    assert (module.document_evidence_path(case["reference"]) is not None) == case["document"], case
+PY
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/project-context-reconstruction-test.XXXXXX")
 trap 'rm -rf "$test_root"' EXIT HUP INT TERM
 
@@ -79,6 +89,10 @@ printf '%s\n' \
   '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Use a local binary because target repositories must not need build tools."}]}}' \
   '{"type":"response_item","payload":{"type":"function_call_output","output":".project-context/model.yaml contained conversation-canonical-must-not-be-materialized"}}' \
   'malformed' > "$session_file"
+printf '%s\n' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Worktree-only specification text."}]}}' \
+  '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The cache experiment failed because stale entries remained."}]}}' \
+  >> "$session_file"
 python3 -c 'import sys; print("{\"type\":\"message\",\"payload\":{\"content\":\"" + "x" * (2 * 1024 * 1024 + 32) + "\"}}")' \
   >> "$session_file"
 printf '%s\n' \
@@ -186,7 +200,7 @@ assert all(
     for session in summary["sessions"]
     for segment in session["frozen_segments"]
 )
-assert summary["counts"]["decision_signals"] == 2
+assert summary["counts"]["decision_signals"] == 4
 assert summary["counts"]["documents"] >= 2
 assert summary["counts"]["document_blocks"] >= 3
 tracked = json.loads((root / "tracked-paths.json").read_text())
@@ -215,29 +229,59 @@ for name in ["commit-coverage.jsonl", "conversation-coverage.jsonl", "untracked-
 path = root / "decision-coverage.jsonl"
 records = [json.loads(line) for line in path.read_text().splitlines()]
 for record in records:
-    record["status"] = "decision"
-    record["topic"] = "local dependency boundary"
-    record["rationale"] = "Target repositories must not need build tools."
-    record["candidate"] = "candidate:local-dependency"
+    if record["source"] == "conversation:codex:codex-related#4":
+        record["status"] = "model"
+        record["topic"] = "worktree specification"
+        record["candidate"] = "behaviors:worktree-specification"
+        record["statement"] = "Worktree-only specification text."
+    elif record["source"] == "conversation:codex:codex-related#5":
+        record["status"] = "attempt"
+        record["topic"] = "cache experiment"
+        record["finding"] = "The cache experiment failed because stale entries remained."
+        record["candidate"] = "candidate:cache-attempt"
+    else:
+        record["status"] = "decision"
+        record["topic"] = "local dependency boundary"
+        record["rationale"] = "Target repositories must not need build tools."
+        record["candidate"] = "candidate:local-dependency"
 path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
 path = root / "document-coverage.jsonl"
 records = [json.loads(line) for line in path.read_text().splitlines()]
+documents = [json.loads(line) for line in (root / "documents.jsonl").read_text().splitlines()]
+blocks = {
+    block["source"]: block
+    for document in documents
+    for block in document.get("blocks", [])
+}
 model = {
     "file:SPEC.md#L1-L1": ("principles:sentence-thought-flow", "Enter complete mixed-language thoughts without repeated phrase selection."),
     "file:SPEC.md#L3-L3": ("constraints:explicit-mvp-exclusions", "Local models, general onboarding, and background deep context are intentionally outside the MVP."),
     "file:SPEC.md#L5-L5": ("principles:latency-first-routing", "Provider routing prioritizes response latency."),
+    "file:SPEC.md#L7-L7": ("behaviors:worktree-specification", "Worktree-only specification text."),
 }
 for record in records:
     if record["source"] in model:
         record["status"] = "model"
         record["topic"] = "durable specification intent"
         record["candidate"], record["statement"] = model[record["source"]]
+        if record["source"] == "file:SPEC.md#L7-L7":
+            record["supported_by"] = ["conversation:codex:codex-related#4"]
+        else:
+            commits = sorted({
+                origin["commit"]
+                for origin in blocks[record["source"]]["line_origins"]
+                if origin["commit"] is not None
+            })
+            record["supported_by"] = [f"commit:{commit}" for commit in commits]
     elif record["source"].startswith("file:renamed.txt#"):
         record["status"] = "recoverable"
         record["topic"] = "fixture implementation"
         record["recovered_by"] = ["file:src/lib.rs"]
+    elif record["status"] == "unavailable":
+        continue
     else:
         record["status"] = "excluded"
+        record["reason_code"] = "non_intent"
         record["reason"] = "Fixture prose with no durable project intent."
 path.write_text("".join(json.dumps(record, sort_keys=True) + "\n" for record in records))
 PY
@@ -318,7 +362,8 @@ missing_candidate_status=$?
 set -e
 [ "$missing_candidate_status" -eq 2 ]
 printf '%s\n' \
-  '{"schema_version":2,"type":"decision","id":"candidate:local-dependency","date":"2026-07-19","occurred_at":"2026-07-19T10:00:00Z","subject":"local dependency boundary","decision":"Use local binaries.","reason":"Target repositories must not need build tools.","evidence":[{"ref":"conversation:codex:codex-related#1","role":"choice"},{"ref":"conversation:claude:claude-related#0","role":"rationale"}]}' \
+  '{"schema_version":3,"type":"decision","id":"candidate:local-dependency","date":"2026-07-19","occurred_at":"2026-07-19T10:00:00Z","subject":"local dependency boundary","decision":"Use local binaries.","reason":"Target repositories must not need build tools.","evidence":[{"ref":"conversation:codex:codex-related#1","role":"choice"},{"ref":"conversation:claude:claude-related#0","role":"rationale"}]}' \
+  '{"schema_version":3,"type":"attempt","id":"candidate:cache-attempt","date":"2026-07-19","subject":"cache experiment","approach":"Reuse cached entries.","result":"failed","finding":"The cache experiment failed because stale entries remained.","evidence":[{"ref":"conversation:codex:codex-related#5","role":"outcome"}]}' \
   > "$candidate_events"
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \
   verify-candidates --inventory "$inventory" --events "$candidate_events" >/dev/null
@@ -326,9 +371,9 @@ cp "$candidate_events" "${candidate_events}.before"
 python3 - "$candidate_events" <<'PY'
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
-event = json.loads(path.read_text())
-event["evidence"].append({"ref": "file:SPEC.md#L999-L999", "role": "context"})
-path.write_text(json.dumps(event) + "\n")
+events = [json.loads(line) for line in path.read_text().splitlines()]
+events[0]["evidence"].append({"ref": "file:SPEC.md#L999-L999", "role": "context"})
+path.write_text("".join(json.dumps(event) + "\n" for event in events))
 PY
 set +e
 HOME="$home" "${repository_root}/reconstruct-project-context/scripts/inventory_local_history.py" \

@@ -85,7 +85,8 @@ fn reconstruction_inventory(
     fs::write(
         inventory.join("coverage-sources.json"),
         serde_json::to_string(&serde_json::json!({
-            "version": 2,
+            "version": 3,
+            "frozen_artifacts": {},
             "sources": {
                 "commit-coverage.jsonl": [],
                 "conversation-coverage.jsonl": conversations,
@@ -221,7 +222,7 @@ fn migration_upgrades_v1_provenance_and_enables_custom_operations() {
     .expect("write v1 model");
     fs::write(
         context.join("events.jsonl"),
-        "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-18\",\"subject\":\"legacy\",\"decision\":\"Preserve it.\",\"reason\":\"It matters.\",\"evidence\":[\"file:README.md\"],\"supersedes\":[]}\n",
+        "{\"schema_version\":1,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-18\",\"subject\":\"legacy\",\"decision\":\"Preserve it.\",\"reason\":\"It matters.\",\"evidence\":[\"file:src/lib.rs\"],\"supersedes\":[]}\n",
     )
     .expect("write v1 event");
 
@@ -235,7 +236,7 @@ fn migration_upgrades_v1_provenance_and_enables_custom_operations() {
         &fs::read_to_string(context.join("model.yaml")).expect("migrated model"),
     )
     .expect("model YAML");
-    assert_eq!(model["schema_version"], 2);
+    assert_eq!(model["schema_version"], 3);
     assert_eq!(model["operations"]["build"][0]["command"], "cargo build");
     assert_eq!(
         model["principles"][0]["event_relations"][0],
@@ -249,7 +250,7 @@ fn migration_upgrades_v1_provenance_and_enables_custom_operations() {
     .expect("event JSON");
     assert_eq!(
         event["evidence"][0],
-        serde_json::json!({"ref":"file:README.md"})
+        serde_json::json!({"ref":"file:src/lib.rs"})
     );
 
     let configured = cli(
@@ -416,7 +417,7 @@ fn reconstruction_applies_atomically_and_is_idempotent() {
     fs::write(
         &proposed_events,
         concat!(
-            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"candidate:decision\",",
+            "{\"schema_version\":3,\"type\":\"decision\",\"id\":\"candidate:decision\",",
             "\"date\":\"2026-07-19\",\"subject\":\"history reconstruction\",",
             "\"decision\":\"Preserve repository-linked local history.\",",
             "\"reason\":\"It contains durable project intent.\",",
@@ -538,7 +539,8 @@ fn reconstruction_requires_exact_model_signal_evidence() {
         directory.path(),
         concat!(
             "{\"source\":\"conversation:codex:model-fixture#7\",\"status\":\"model\",",
-            "\"topic\":\"model-only intent\",\"candidate\":\"architecture:model-signal\"}\n"
+            "\"topic\":\"model-only intent\",\"candidate\":\"architecture:model-signal\",",
+            "\"statement\":\"Preserve model-only intent.\"}\n"
         ),
         &[source],
         &[],
@@ -561,6 +563,26 @@ fn reconstruction_requires_exact_model_signal_evidence() {
     let valid = cli(directory.path(), &arguments);
     assert!(valid.status.success(), "{}", stdout(&valid));
 
+    let mismatched_coverage = fs::read_to_string(inventory.join("decision-coverage.jsonl"))
+        .expect("read decision coverage")
+        .replace("Preserve model-only intent.", "Replace model-only intent.");
+    fs::write(
+        inventory.join("decision-coverage.jsonl"),
+        mismatched_coverage,
+    )
+    .expect("write mismatched coverage");
+    let mismatched = cli(directory.path(), &arguments);
+    assert_eq!(mismatched.status.code(), Some(1));
+    fs::write(
+        inventory.join("decision-coverage.jsonl"),
+        concat!(
+            "{\"source\":\"conversation:codex:model-fixture#7\",\"status\":\"model\",",
+            "\"topic\":\"model-only intent\",\"candidate\":\"architecture:model-signal\",",
+            "\"statement\":\"Preserve model-only intent.\"}\n"
+        ),
+    )
+    .expect("restore decision coverage");
+
     let invalid_model = fs::read_to_string(&proposed_model)
         .expect("read proposed model")
         .replace(source, "conversation:codex:model-fixture#8");
@@ -578,8 +600,8 @@ fn reconstruction_writes_a_stable_event_timeline() {
     fs::write(
         context.join("events.jsonl"),
         concat!(
-            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-20\",\"subject\":\"late existing\",\"decision\":\"late\",\"reason\":\"late\"}\n",
-            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-2\",\"date\":\"2026-07-18\",\"subject\":\"early existing\",\"decision\":\"early\",\"reason\":\"early\"}\n",
+            "{\"schema_version\":3,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-07-20\",\"subject\":\"late existing\",\"decision\":\"late\",\"reason\":\"late\"}\n",
+            "{\"schema_version\":3,\"type\":\"decision\",\"id\":\"D-2\",\"date\":\"2026-07-18\",\"subject\":\"early existing\",\"decision\":\"early\",\"reason\":\"early\"}\n",
         ),
     )
     .expect("write base events");
@@ -593,8 +615,8 @@ fn reconstruction_writes_a_stable_event_timeline() {
     fs::write(
         &proposed_events,
         concat!(
-            "{\"schema_version\":2,\"type\":\"attempt\",\"id\":\"candidate:middle-attempt\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T10:00:00Z\",\"subject\":\"middle attempt\",\"approach\":\"try\",\"result\":\"failed\",\"finding\":\"finding\",\"evidence\":[{\"ref\":\"conversation:codex:fixture#2\",\"role\":\"outcome\",\"observed_at\":\"2026-07-19T10:00:00Z\"}]}\n",
-            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"candidate:middle-decision\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T09:00:00Z\",\"subject\":\"middle decision\",\"decision\":\"middle\",\"reason\":\"middle\",\"evidence\":[{\"ref\":\"conversation:codex:fixture#1\",\"role\":\"choice\",\"observed_at\":\"2026-07-19T09:00:00Z\"}]}\n",
+            "{\"schema_version\":3,\"type\":\"attempt\",\"id\":\"candidate:middle-attempt\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T10:00:00Z\",\"subject\":\"middle attempt\",\"approach\":\"try\",\"result\":\"failed\",\"finding\":\"finding\",\"evidence\":[{\"ref\":\"conversation:codex:fixture#2\",\"role\":\"outcome\",\"observed_at\":\"2026-07-19T10:00:00Z\"}]}\n",
+            "{\"schema_version\":3,\"type\":\"decision\",\"id\":\"candidate:middle-decision\",\"date\":\"2026-07-19\",\"occurred_at\":\"2026-07-19T09:00:00Z\",\"subject\":\"middle decision\",\"decision\":\"middle\",\"reason\":\"middle\",\"evidence\":[{\"ref\":\"conversation:codex:fixture#1\",\"role\":\"choice\",\"observed_at\":\"2026-07-19T09:00:00Z\"}]}\n",
         ),
     )
     .expect("write proposed events");

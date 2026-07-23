@@ -1,0 +1,11 @@
+[
+  {"reference": "file:README#overview", "document": true},
+  {"reference": "file:docs/SPEC.md#L1-L3", "document": true},
+  {"reference": "file:notes/Design.RST", "document": true},
+  {"reference": "file:guide/ARCHITECTURE.adoc", "document": true},
+  {"reference": "file:notes/research.TXT#L2", "document": true},
+  {"reference": "file:src/readme.rs", "document": false},
+  {"reference": "file:schemas/model.schema.json", "document": false},
+  {"reference": "file:tests/fixture.yaml", "document": false},
+  {"reference": "commit:1111111111111111111111111111111111111111", "document": false}
+]

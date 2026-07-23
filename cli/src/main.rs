@@ -115,7 +115,7 @@ enum Command {
         #[arg(long)]
         relation: Vec<String>,
     },
-    /// Atomically migrate a legacy v1 store to schema v2.
+    /// Atomically migrate a legacy v1 or v2 store to schema v3.
     Migrate,
     /// Atomically apply a validated reconstruction of model and event history.
     ApplyReconstruction {

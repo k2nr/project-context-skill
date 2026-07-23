@@ -107,11 +107,16 @@ Use `--result inconclusive` for unresolved investigations.
 
 Use `commit:<sha>` only for an existing commit. For work in the current commit,
 citing a file, test, issue, or artifact is preferable to predicting a hash.
+Never cite tracked documentation as canonical evidence. Markdown, reStructuredText, AsciiDoc,
+text files, and conventional README/SPEC/DESIGN/ARCHITECTURE/DECISIONS/ROADMAP paths are audit
+inputs only; cite the commit that introduced the intent, a direct-user conversation record, or
+recoverable code, test, or schema instead.
 Model entries may use the same structured `evidence` objects and typed `event_relations` to state
 whether an event is their origin, rationale, validation, implementation, or constraint.
 
-Legacy schema v1 stores remain readable. Before using structured evidence, typed relations, exact
-timestamps, or custom operations, migrate all four canonical files atomically:
+Legacy schema v1 and v2 stores remain readable. Schema v3 forbids document evidence. Before
+migration, replace every document reference listed by `migrate`; it writes nothing while any remain.
+Then migrate all four canonical files atomically:
 
 ```bash
 .agents/skills/project-context/bin/project-context migrate

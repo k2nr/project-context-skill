@@ -61,12 +61,16 @@ Never infer consent from invoking this skill. Skip the question only when the us
    - `attempt`: a reusable experiment outcome, with `topic`, `finding`, and a `candidate:` Attempt;
    - `recoverable`: content recoverable from current code, tests, or schemas, with `topic` and one or
      more frozen code, test, or schema `file:` references in `recovered_by`;
-   - `excluded` or `unavailable`, with a specific `reason`.
+   - `excluded`, with a closed `reason_code`, a specific `reason`, and `duplicate_of` when the code
+     is `duplicate_within_document`;
+   - `unavailable`, retained exactly as emitted by collection.
 
    A tracked document cannot be used as its own `recoverable` evidence. Do not summarize a whole
-   file as covered when one block remains `pending`. Candidate events must cite the exact block
-   source. New model entries must cite it; an unchanged base model entry may satisfy the block only
-   when its normalized statement exactly matches the independently extracted statement.
+   file as covered when one block remains `pending`. For `model`, `decision`, and `attempt`, set
+   `supported_by` to either every origin commit recorded for the block's non-empty lines or a frozen
+   direct-user signal mapped to the same candidate. Uncommitted worktree lines have no commit
+   support. Document block refs are temporary mapping identities and must never appear in canonical
+   evidence.
 7. Review the remaining history in two passes: first chronologically classify every `pending` commit,
    conversation record, and selected untracked file; then inspect relevant topics in depth. Change
    every ordinary coverage item to `analyzed`, `excluded`, or `unavailable`, with a reason for the
@@ -78,6 +82,8 @@ Never infer consent from invoking this skill. Skip the question only when the us
    - `decision`: a durable choice whose supporting rationale must be traced through the surrounding
      exchange, summarized in `rationale`, and linked through `candidate` to the exact candidate
      Decision that repeats that rationale and includes this source as evidence;
+   - `attempt`: a reusable outcome whose `finding` and `candidate` match an Attempt that includes
+     this source as evidence;
    - `model`: durable current intent that belongs in the model but lacks a reason-qualified Decision;
    - `excluded`: not durable project intent, with a specific reason;
    - `unavailable`: the decision signal cannot be evaluated, with a specific reason.
@@ -99,10 +105,11 @@ Never infer consent from invoking this skill. Skip the question only when the us
    which their earliest qualifying evidence occurred. Set `occurred_at` only to an explicit choice
    time for a decision or outcome time for an attempt; matching evidence must use `role: choice` or
    `role: outcome` and the same `observed_at`. Keep rationale and context timestamps only on their
-   evidence items, and do not infer a time from sequence alone. Emit schema v2 structured evidence
+   evidence items, and do not infer a time from sequence alone. Emit schema v3 structured evidence
    with `ref`, and add `role` or `observed_at` only when the source supports them. Use typed
    relations, including scoped `partially_supersedes`, instead of flattening every historical change
-   into full supersession. Then require every `decision` signal to be
+   into full supersession. Never emit document `file:` refs. Then require every `decision` or
+   `attempt` signal to be
    represented in candidate event evidence:
 
    ```sh

@@ -53,3 +53,6 @@ conventional extensionless README, SPEC, DESIGN, ARCHITECTURE, DECISIONS, and RO
 them into non-empty blocks at blank lines. Record non-UTF-8, oversized, missing, or non-regular
 documents as unavailable. Snapshots and block manifests are private temporary inventory data and
 must never be copied into the repository.
+For each non-empty line, freeze the origin commit from `git blame --line-porcelain --follow`.
+Worktree-only lines remain explicitly uncovered. These origins support candidate evidence, while
+the document path and line range remain temporary audit identities only.

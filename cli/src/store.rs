@@ -17,8 +17,19 @@ use time::{
 const MODEL_TEMPLATE: &str = include_str!("../../project-context/assets/init/model.yaml");
 const MODEL_SCHEMA: &str = include_str!("../../project-context/assets/init/model.schema.json");
 const EVENT_SCHEMA: &str = include_str!("../../project-context/assets/init/event.schema.json");
+const MODEL_SCHEMA_V2: &str = include_str!("schemas/model-v2.json");
+const EVENT_SCHEMA_V2: &str = include_str!("schemas/event-v2.json");
 const MODEL_SCHEMA_V1: &str = include_str!("schemas/model-v1.json");
 const EVENT_SCHEMA_V1: &str = include_str!("schemas/event-v1.json");
+const DOCUMENT_SUFFIXES: [&str; 6] = [".md", ".mdx", ".rst", ".adoc", ".asciidoc", ".txt"];
+const DOCUMENT_BASENAMES: [&str; 6] = [
+    "readme",
+    "spec",
+    "design",
+    "architecture",
+    "decisions",
+    "roadmap",
+];
 
 const INIT_PATHS: [&str; 4] = [
     ".project-context/model.yaml",
@@ -55,6 +66,8 @@ pub struct MigrateReport {
     pub events_migrated: usize,
     pub schemas_updated: bool,
     pub no_op: bool,
+    pub from_version: u64,
+    pub to_version: u64,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -705,15 +718,53 @@ pub fn migrate(root: &Path) -> Result<MigrateReport, StoreError> {
     }
 
     let mut model = current_data.model;
-    let model_migrated = model.get("schema_version").and_then(Value::as_u64) == Some(1);
-    if model_migrated {
+    let from_version = model
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let event_versions: BTreeSet<u64> = current_data
+        .events
+        .iter()
+        .filter_map(|event| event.get("schema_version").and_then(Value::as_u64))
+        .collect();
+    if event_versions
+        .iter()
+        .any(|version| *version != from_version)
+    {
+        let _ = lock.unlock();
+        return Err(invalid_data_error(
+            "model and event schema versions must match before migration".to_owned(),
+        ));
+    }
+    let document_errors = canonical_document_evidence_errors(&model, &current_data.events);
+    if !document_errors.is_empty() {
+        let _ = lock.unlock();
+        let mut report = ValidationReport {
+            errors: document_errors,
+            ..ValidationReport::default()
+        };
+        report.normalize();
+        return Err(StoreError::Invalid(report));
+    }
+
+    let model_migrated = from_version < 3;
+    if from_version == 1 {
         migrate_model_value(&mut model);
+    } else if from_version == 2 {
+        model["schema_version"] = Value::from(3);
     }
     let mut events = current_data.events;
     let mut events_migrated = 0;
     for event in &mut events {
-        if event.get("schema_version").and_then(Value::as_u64) == Some(1) {
+        let version = event
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        if version == 1 {
             migrate_event_value(event);
+            events_migrated += 1;
+        } else if version == 2 {
+            event["schema_version"] = Value::from(3);
             events_migrated += 1;
         }
     }
@@ -727,6 +778,8 @@ pub fn migrate(root: &Path) -> Result<MigrateReport, StoreError> {
             events_migrated,
             schemas_updated,
             no_op,
+            from_version,
+            to_version: 3,
         });
     }
 
@@ -761,11 +814,13 @@ pub fn migrate(root: &Path) -> Result<MigrateReport, StoreError> {
         events_migrated,
         schemas_updated,
         no_op,
+        from_version,
+        to_version: 3,
     })
 }
 
 fn migrate_model_value(model: &mut Value) {
-    model["schema_version"] = Value::from(2);
+    model["schema_version"] = Value::from(3);
     for section in ["principles", "architecture", "behaviors", "constraints"] {
         let Some(entries) = model.get_mut(section).and_then(Value::as_array_mut) else {
             continue;
@@ -808,7 +863,7 @@ fn migrate_event_value(event: &mut Value) {
     let Some(object) = event.as_object_mut() else {
         return;
     };
-    object.insert("schema_version".to_owned(), Value::from(2));
+    object.insert("schema_version".to_owned(), Value::from(3));
     if let Some(Value::Array(evidence)) = object.get_mut("evidence") {
         for item in evidence.iter_mut() {
             if let Some(reference) = item.as_str().map(str::to_owned) {
@@ -1163,39 +1218,19 @@ fn validate_reconstruction_audit(
     validate_document_audit(
         inventory,
         &document_records,
+        &records,
         proposed_model,
         candidates,
         &candidates_by_id,
-        current_data,
         &allowed_files,
         errors,
     );
-    let allowed_document_sources = if inventory.join("document-coverage.jsonl").exists() {
-        inventory_manifest_sources(inventory, "document-coverage.jsonl", errors)
-    } else {
-        BTreeSet::new()
-    };
-    let audited_document_paths: BTreeSet<String> = allowed_document_sources
-        .iter()
-        .filter_map(|source| {
-            document_source_path(source)
-                .or_else(|| {
-                    source
-                        .strip_prefix("file:")
-                        .filter(|path| !path.contains("#L"))
-                })
-                .map(str::to_owned)
-        })
-        .collect();
-
     let mut used_conversations = BTreeMap::new();
     {
         let mut evidence_scope = ReconstructionEvidenceScope {
             conversations: &allowed_conversations,
             commits: &allowed_commits,
             files: &allowed_files,
-            document_paths: &audited_document_paths,
-            document_sources: &allowed_document_sources,
             used_conversations: &mut used_conversations,
             errors,
         };
@@ -1242,7 +1277,7 @@ fn validate_reconstruction_audit(
     for record in &records {
         let source = record.get("source").and_then(Value::as_str).unwrap_or("");
         let status = record.get("status").and_then(Value::as_str).unwrap_or("");
-        if matches!(status, "decision" | "model")
+        if matches!(status, "decision" | "attempt" | "model")
             && record
                 .get("topic")
                 .and_then(Value::as_str)
@@ -1257,6 +1292,14 @@ fn validate_reconstruction_audit(
                 .is_none_or(|value| value.trim().is_empty())
         {
             errors.push(format!("decision signal '{source}' has no rationale"));
+        }
+        if status == "attempt"
+            && record
+                .get("finding")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            errors.push(format!("attempt signal '{source}' has no finding"));
         }
         if matches!(status, "excluded" | "unavailable")
             && record
@@ -1302,6 +1345,39 @@ fn validate_reconstruction_audit(
                     ));
                 }
             }
+            "attempt" => {
+                let candidate = record
+                    .get("candidate")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let Some(event) = candidates_by_id.get(candidate) else {
+                    errors.push(format!(
+                        "attempt signal '{source}' references missing candidate '{candidate}'"
+                    ));
+                    continue;
+                };
+                if event.get("type").and_then(Value::as_str) != Some("attempt") {
+                    errors.push(format!(
+                        "attempt signal '{source}' candidate '{candidate}' is not an attempt"
+                    ));
+                }
+                if !has_evidence_ref(event, source) {
+                    errors.push(format!(
+                        "attempt signal '{source}' is absent from candidate event evidence"
+                    ));
+                }
+                let expected = normalize_whitespace(
+                    record.get("finding").and_then(Value::as_str).unwrap_or(""),
+                );
+                let actual = normalize_whitespace(
+                    event.get("finding").and_then(Value::as_str).unwrap_or(""),
+                );
+                if expected != actual {
+                    errors.push(format!(
+                        "attempt signal '{source}' finding differs from '{candidate}'"
+                    ));
+                }
+            }
             "model" => {
                 let mapping = record
                     .get("candidate")
@@ -1327,6 +1403,24 @@ fn validate_reconstruction_audit(
                     errors.push(format!(
                         "model signal '{source}' is absent from '{mapping}' evidence"
                     ));
+                } else {
+                    let expected = normalize_whitespace(
+                        record
+                            .get("statement")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    );
+                    let actual = normalize_whitespace(
+                        entry
+                            .and_then(|entry| entry.get("statement"))
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    );
+                    if expected.is_empty() || expected != actual {
+                        errors.push(format!(
+                            "model signal '{source}' statement differs from '{mapping}'"
+                        ));
+                    }
                 }
             }
             "excluded" | "unavailable" => {
@@ -1347,10 +1441,10 @@ fn validate_reconstruction_audit(
 fn validate_document_audit(
     inventory: &Path,
     records: &[Value],
+    direct_user_records: &[Value],
     proposed_model: &Value,
     candidates: &[Value],
     candidates_by_id: &BTreeMap<String, &Value>,
-    current_data: &RepositoryData,
     allowed_files: &BTreeSet<String>,
     errors: &mut Vec<String>,
 ) {
@@ -1386,6 +1480,56 @@ fn validate_document_audit(
                 .map(str::to_owned)
         })
         .collect();
+    let documents = fs::read_to_string(inventory.join("documents.jsonl"))
+        .ok()
+        .map(|content| parse_event_lines(&content, "documents inventory", errors))
+        .unwrap_or_default();
+    let mut origin_commits: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut uncovered_origins = BTreeSet::new();
+    let mut unavailable_reasons = BTreeMap::new();
+    for document in &documents {
+        if let Some(path) = document.get("path").and_then(Value::as_str)
+            && document.get("snapshot").is_none_or(Value::is_null)
+            && let Some(reason) = document.get("unavailable_reason").and_then(Value::as_str)
+        {
+            unavailable_reasons.insert(format!("file:{path}"), reason.to_owned());
+        }
+        for block in document
+            .get("blocks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(block_source) = block.get("source").and_then(Value::as_str) else {
+                continue;
+            };
+            let commits = origin_commits.entry(block_source.to_owned()).or_default();
+            for origin in block
+                .get("line_origins")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(commit) = origin.get("commit").and_then(Value::as_str) {
+                    commits.insert(commit.to_owned());
+                } else {
+                    uncovered_origins.insert(block_source.to_owned());
+                }
+            }
+        }
+    }
+    let direct_user: BTreeMap<String, &Value> = direct_user_records
+        .iter()
+        .filter_map(|record| Some((record.get("source")?.as_str()?.to_owned(), record)))
+        .collect();
+    let exclusion_reasons: BTreeSet<&str> = [
+        "non_intent",
+        "navigation_or_formatting",
+        "duplicate_within_document",
+        "generated_reference",
+    ]
+    .into_iter()
+    .collect();
     for record in records {
         let source = record.get("source").and_then(Value::as_str).unwrap_or("");
         let status = record.get("status").and_then(Value::as_str).unwrap_or("");
@@ -1416,6 +1560,11 @@ fn validate_document_audit(
             errors.push(format!("document {status} '{source}' has no topic"));
         }
         let owners = reconstruction_evidence_owners(source, proposed_model, candidates);
+        if !owners.is_empty() {
+            errors.push(format!(
+                "document source '{source}' is forbidden as canonical evidence"
+            ));
+        }
         match status {
             "model" => {
                 let mapping = record
@@ -1454,24 +1603,17 @@ fn validate_document_audit(
                         "document model '{source}' statement differs from '{mapping}'"
                     ));
                 }
-                let existing = current_data
-                    .model
-                    .get(section)
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .any(|base| base == entry);
-                let expected_owner = format!("model:{mapping}");
-                if !existing && !owners.contains(&expected_owner) {
-                    errors.push(format!(
-                        "document source '{source}' is absent from '{mapping}' evidence"
-                    ));
-                }
-                if owners.iter().any(|owner| owner != &expected_owner) {
-                    errors.push(format!(
-                        "document source '{source}' is used outside '{mapping}'"
-                    ));
-                }
+                validate_document_support(
+                    source,
+                    status,
+                    mapping,
+                    record,
+                    entry,
+                    &origin_commits,
+                    &uncovered_origins,
+                    &direct_user,
+                    errors,
+                );
             }
             "decision" | "attempt" => {
                 let candidate = record
@@ -1508,17 +1650,17 @@ fn validate_document_audit(
                         "document {status} '{source}' {record_field} differs from '{candidate}'"
                     ));
                 }
-                let expected_owner = format!("event:{candidate}");
-                if !owners.contains(&expected_owner) {
-                    errors.push(format!(
-                        "document source '{source}' is absent from '{candidate}' evidence"
-                    ));
-                }
-                if owners.iter().any(|owner| owner != &expected_owner) {
-                    errors.push(format!(
-                        "document source '{source}' is used outside '{candidate}'"
-                    ));
-                }
+                validate_document_support(
+                    source,
+                    status,
+                    candidate,
+                    record,
+                    event,
+                    &origin_commits,
+                    &uncovered_origins,
+                    &direct_user,
+                    errors,
+                );
             }
             "recoverable" => {
                 let references = record.get("recovered_by").and_then(Value::as_array);
@@ -1555,29 +1697,110 @@ fn validate_document_audit(
                         ));
                     }
                 }
-                if !owners.is_empty() {
+            }
+            "excluded" => {
+                let reason_code = record.get("reason_code").and_then(Value::as_str);
+                if reason_code.is_none_or(|value| !exclusion_reasons.contains(value))
+                    || record
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_none_or(|value| value.trim().is_empty())
+                {
                     errors.push(format!(
-                        "recoverable document source '{source}' is used as canonical evidence"
+                        "excluded document source '{source}' requires an allowed reason code and reason"
                     ));
                 }
-            }
-            "excluded" | "unavailable" => {
-                if record
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .is_none_or(|value| value.trim().is_empty())
-                {
-                    errors.push(format!("document {status} '{source}' has no reason"));
+                if reason_code == Some("duplicate_within_document") {
+                    let duplicate = record.get("duplicate_of").and_then(Value::as_str);
+                    if duplicate == Some(source)
+                        || duplicate.is_none_or(|value| !sources.contains(value))
+                    {
+                        errors.push(format!(
+                            "excluded document source '{source}' requires another frozen duplicate_of block"
+                        ));
+                    }
                 }
-                if !owners.is_empty() {
+            }
+            "unavailable" => {
+                if record.get("reason").and_then(Value::as_str)
+                    != unavailable_reasons.get(source).map(String::as_str)
+                {
                     errors.push(format!(
-                        "{status} document source '{source}' is used as canonical evidence"
+                        "unavailable document source '{source}' is not collector-owned"
                     ));
                 }
             }
             _ => errors.push(format!(
                 "document coverage source '{source}' has unresolved status '{status}'"
             )),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_document_support(
+    source: &str,
+    status: &str,
+    candidate: &str,
+    record: &Value,
+    owner: &Value,
+    origins: &BTreeMap<String, BTreeSet<String>>,
+    uncovered: &BTreeSet<String>,
+    direct_user: &BTreeMap<String, &Value>,
+    errors: &mut Vec<String>,
+) {
+    let references: Vec<&str> = record
+        .get("supported_by")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if references.is_empty() {
+        errors.push(format!(
+            "document {status} '{source}' requires supported_by evidence"
+        ));
+        return;
+    }
+    let expected_commits = origins.get(source).cloned().unwrap_or_default();
+    let supplied_commits: BTreeSet<String> = references
+        .iter()
+        .filter_map(|reference| reference.strip_prefix("commit:").map(str::to_owned))
+        .collect();
+    if !supplied_commits.is_subset(&expected_commits) {
+        errors.push(format!(
+            "document {status} '{source}' uses an unrelated origin commit"
+        ));
+    }
+    let mut direct_support = false;
+    for reference in &references {
+        if reference.starts_with("commit:") {
+            continue;
+        }
+        let matches = direct_user.get(*reference).is_some_and(|signal| {
+            signal.get("status").and_then(Value::as_str) == Some(status)
+                && signal.get("candidate").and_then(Value::as_str) == Some(candidate)
+        });
+        if !matches {
+            errors.push(format!(
+                "document {status} '{source}' uses unrelated direct-user evidence '{reference}'"
+            ));
+        } else {
+            direct_support = true;
+        }
+    }
+    let commits_complete =
+        !uncovered.contains(source) && expected_commits.is_subset(&supplied_commits);
+    if !commits_complete && !direct_support {
+        errors.push(format!(
+            "document {status} '{source}' lacks complete origin or direct-user support"
+        ));
+    }
+    for reference in references {
+        if !has_evidence_ref(owner, reference) {
+            errors.push(format!(
+                "document {status} '{source}' support '{reference}' is absent from '{candidate}' evidence"
+            ));
         }
     }
 }
@@ -2045,10 +2268,22 @@ fn validate_resolved_inventory_coverage(
         ));
         return BTreeMap::new();
     };
-    if manifest.get("version").and_then(Value::as_u64) != Some(2) {
+    if manifest.get("version").and_then(Value::as_u64) != Some(3) {
         errors.push(
             "frozen source manifest has an unsupported version; recollect the inventory".to_owned(),
         );
+    }
+    if include_git {
+        let documents_path = inventory.join("documents.jsonl");
+        let actual = fs::read(&documents_path)
+            .ok()
+            .map(|content| format!("{:x}", Sha256::digest(content)));
+        let expected = manifest
+            .pointer("/frozen_artifacts/documents.jsonl")
+            .and_then(Value::as_str);
+        if actual.as_deref() != expected {
+            errors.push("documents.jsonl differs from the frozen manifest".to_owned());
+        }
     }
     let mut expected_names: BTreeSet<&str> = specifications
         .iter()
@@ -2340,8 +2575,6 @@ struct ReconstructionEvidenceScope<'a> {
     conversations: &'a BTreeSet<String>,
     commits: &'a BTreeSet<String>,
     files: &'a BTreeSet<String>,
-    document_paths: &'a BTreeSet<String>,
-    document_sources: &'a BTreeSet<String>,
     used_conversations: &'a mut BTreeMap<String, String>,
     errors: &'a mut Vec<String>,
 }
@@ -2391,15 +2624,13 @@ fn validate_reconstruction_evidence(
             }
         } else if let Some(file) = reference.strip_prefix("file:") {
             let path = file.split('#').next().unwrap_or(file);
-            if !scope.files.contains(path) {
+            if is_document_path(path) {
+                scope.errors.push(format!(
+                    "{label} uses forbidden document evidence: '{reference}'"
+                ));
+            } else if !scope.files.contains(path) {
                 scope.errors.push(format!(
                     "{label} uses file outside the frozen inventory: '{path}'"
-                ));
-            } else if scope.document_paths.contains(path)
-                && !scope.document_sources.contains(reference)
-            {
-                scope.errors.push(format!(
-                    "{label} uses a document reference outside the frozen block inventory: '{reference}'"
                 ));
             } else {
                 accepted += 1;
@@ -2961,6 +3192,20 @@ fn insert_event_metadata(
     supersedes: Vec<String>,
     mut relations: Vec<Value>,
 ) -> Result<(), String> {
+    for reference in &evidence {
+        if document_evidence_path(reference).is_some() {
+            return Err(format!(
+                "document evidence is forbidden in canonical Project Context: {reference}"
+            ));
+        }
+    }
+    for reference in evidence_details.iter().filter_map(evidence_reference) {
+        if document_evidence_path(reference).is_some() {
+            return Err(format!(
+                "document evidence is forbidden in canonical Project Context: {reference}"
+            ));
+        }
+    }
     if schema_version == 1 {
         if !evidence_details.is_empty() || !relations.is_empty() {
             return Err(
@@ -3223,17 +3468,22 @@ fn inspect_documents(
     let model_schema = accepted_schema(
         "model.schema.json",
         model_schema_text,
-        MODEL_SCHEMA,
-        MODEL_SCHEMA_V1,
+        &[MODEL_SCHEMA, MODEL_SCHEMA_V2, MODEL_SCHEMA_V1],
         &mut report,
     );
     let event_schema = accepted_schema(
         "event.schema.json",
         event_schema_text,
-        EVENT_SCHEMA,
-        EVENT_SCHEMA_V1,
+        &[EVENT_SCHEMA, EVENT_SCHEMA_V2, EVENT_SCHEMA_V1],
         &mut report,
     );
+    if let (Some(model_schema), Some(event_schema)) = (model_schema, event_schema)
+        && embedded_schema_version(model_schema) != embedded_schema_version(event_schema)
+    {
+        report.errors.push(
+            "model.schema.json and event.schema.json must use the same schema version".to_owned(),
+        );
+    }
     let model_validator = model_schema
         .and_then(|schema| compile_schema("embedded model.schema.json", schema, &mut report));
     let event_validator = event_schema
@@ -3294,22 +3544,30 @@ fn inspect_documents(
     (report, RepositoryData { model, events })
 }
 
+fn embedded_schema_version(content: &str) -> Option<u64> {
+    let schema = serde_json::from_str::<Value>(content).ok()?;
+    schema
+        .pointer("/properties/schema_version/const")
+        .or_else(|| schema.pointer("/$defs/common/properties/schema_version/const"))
+        .and_then(Value::as_u64)
+}
+
 fn accepted_schema(
     label: &str,
     content: &str,
-    current: &'static str,
-    legacy: &'static str,
+    supported: &[&'static str],
     report: &mut ValidationReport,
 ) -> Option<&'static str> {
     let local = serde_json::from_str::<Value>(content);
-    let current_value =
-        serde_json::from_str::<Value>(current).expect("embedded current schema is valid JSON");
-    let legacy_value =
-        serde_json::from_str::<Value>(legacy).expect("embedded legacy schema is valid JSON");
     match local {
-        Ok(local) if local == current_value => Some(current),
-        Ok(local) if local == legacy_value => Some(legacy),
-        Ok(_) => {
+        Ok(local) => {
+            for schema in supported {
+                let embedded = serde_json::from_str::<Value>(schema)
+                    .expect("embedded supported schema is valid JSON");
+                if local == embedded {
+                    return Some(schema);
+                }
+            }
             report.errors.push(format!(
                 "{label} differs from the supported embedded schemas"
             ));
@@ -3332,6 +3590,80 @@ fn evidence_reference(value: &Value) -> Option<&str> {
     value
         .as_str()
         .or_else(|| value.get("ref").and_then(Value::as_str))
+}
+
+fn document_evidence_path(reference: &str) -> Option<&str> {
+    let path = reference.strip_prefix("file:")?.split('#').next()?;
+    is_document_path(path).then_some(path)
+}
+
+fn is_document_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(&normalized)
+        .to_lowercase();
+    DOCUMENT_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        || DOCUMENT_BASENAMES.contains(&name.as_str())
+}
+
+fn canonical_document_evidence_errors(model: &Value, events: &[Value]) -> Vec<String> {
+    let mut errors = Vec::new();
+    if model.get("schema_version").and_then(Value::as_u64) == Some(3) {
+        for section in ["principles", "architecture", "behaviors", "constraints"] {
+            for entry in model
+                .get(section)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                for reference in entry
+                    .get("evidence")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(evidence_reference)
+                {
+                    if document_evidence_path(reference).is_some() {
+                        errors.push(format!(
+                            "model {section}:{id} has document evidence that must be replaced: {reference}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (index, event) in events.iter().enumerate() {
+        if event.get("schema_version").and_then(Value::as_u64) != Some(3) {
+            continue;
+        }
+        let id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        for reference in event
+            .get("evidence")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(evidence_reference)
+        {
+            if document_evidence_path(reference).is_some() {
+                errors.push(format!(
+                    "events.jsonl line {} ({id}) has document evidence that must be replaced: {reference}",
+                    index + 1
+                ));
+            }
+        }
+    }
+    errors
 }
 
 fn add_git_validation_warnings(root: &Path, data: &RepositoryData, report: &mut ValidationReport) {
@@ -3437,6 +3769,7 @@ fn collect_schema_errors(
 }
 
 fn validate_cross_records(model: &Value, events: &[Value], errors: &mut Vec<String>) {
+    errors.extend(canonical_document_evidence_errors(model, events));
     let sections = ["principles", "architecture", "behaviors", "constraints"];
     for section in sections {
         let mut ids = BTreeSet::new();
@@ -4016,10 +4349,178 @@ mod tests {
     }
 
     #[test]
+    fn schema_v3_rejects_document_evidence_and_legacy_v2_remains_readable() {
+        let current = initialized();
+        let model_path = current.path().join(".project-context/model.yaml");
+        write(
+            &model_path,
+            &MODEL_TEMPLATE.replace(
+                "principles: []",
+                "principles:\n  - id: documented\n    statement: Keep this intent.\n    evidence:\n      - ref: file:SPEC.md#L1-L1",
+            ),
+        );
+        let report = validate(&current);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("forbidden") || error.contains("must be replaced"))
+        );
+
+        let legacy = initialized();
+        let project = legacy.path().join(".project-context");
+        write(&project.join("schemas/model.schema.json"), MODEL_SCHEMA_V2);
+        write(&project.join("schemas/event.schema.json"), EVENT_SCHEMA_V2);
+        write(
+            &project.join("model.yaml"),
+            &MODEL_TEMPLATE
+                .replace("schema_version: 3", "schema_version: 2")
+                .replace(
+                    "principles: []",
+                    "principles:\n  - id: documented\n    statement: Keep this intent.\n    evidence:\n      - ref: file:SPEC.md#L1-L1",
+                ),
+        );
+        assert!(validate(&legacy).valid);
+    }
+
+    #[test]
+    fn validation_rejects_mixed_schema_versions_and_checks_each_v3_record() {
+        let mixed = initialized();
+        let project = mixed.path().join(".project-context");
+        write(&project.join("schemas/event.schema.json"), EVENT_SCHEMA_V2);
+        let report = validate(&mixed);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("must use the same schema version"))
+        );
+
+        let mixed_event = initialized();
+        let project = mixed_event.path().join(".project-context");
+        write(&project.join("schemas/model.schema.json"), MODEL_SCHEMA_V2);
+        write(
+            &project.join("model.yaml"),
+            &MODEL_TEMPLATE.replace("schema_version: 3", "schema_version: 2"),
+        );
+        write(
+            &project.join("events.jsonl"),
+            concat!(
+                "{\"schema_version\":3,\"type\":\"attempt\",\"id\":\"A-1\",",
+                "\"date\":\"2026-07-22\",\"subject\":\"audit\",\"approach\":\"inspect\",",
+                "\"result\":\"partial\",\"finding\":\"missed intent\",",
+                "\"evidence\":[{\"ref\":\"file:README.md\"}]}\n"
+            ),
+        );
+        let report = validate(&mixed_event);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("must use the same schema version"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("document evidence that must be replaced"))
+        );
+    }
+
+    #[test]
+    fn document_evidence_classifier_matches_the_shared_fixture() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../../tests/fixtures/document-paths.json"))
+                .expect("document path fixture");
+        for case in cases {
+            let reference = case["reference"].as_str().expect("reference");
+            assert_eq!(
+                document_evidence_path(reference).is_some(),
+                case["document"].as_bool().expect("document flag"),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_lists_document_evidence_without_writing_then_upgrades_every_record() {
+        let directory = initialized();
+        let project = directory.path().join(".project-context");
+        write(&project.join("schemas/model.schema.json"), MODEL_SCHEMA_V2);
+        write(&project.join("schemas/event.schema.json"), EVENT_SCHEMA_V2);
+        let legacy_model = MODEL_TEMPLATE
+            .replace("schema_version: 3", "schema_version: 2")
+            .replace(
+                "principles: []",
+                "principles:\n  - id: documented\n    statement: Keep this intent.\n    evidence:\n      - ref: file:SPEC.md#L1-L1",
+            );
+        let legacy_events = "{\"schema_version\":2,\"type\":\"attempt\",\"id\":\"A-1\",\"date\":\"2026-07-22\",\"subject\":\"audit\",\"approach\":\"inspect\",\"result\":\"partial\",\"finding\":\"missed intent\",\"evidence\":[{\"ref\":\"file:README.md\"}]}\n";
+        write(&project.join("model.yaml"), &legacy_model);
+        write(&project.join("events.jsonl"), legacy_events);
+        let before =
+            INIT_PATHS.map(|path| fs::read(directory.path().join(path)).expect("migration input"));
+
+        let error = migrate(directory.path()).expect_err("document evidence blocks migration");
+        assert!(matches!(
+            error,
+            StoreError::Invalid(report)
+                if report.errors.len() == 2
+                    && report.errors.iter().any(|item| item.contains("principles:documented"))
+                    && report.errors.iter().any(|item| item.contains("line 1 (A-1)"))
+        ));
+        for (path, expected) in INIT_PATHS.iter().zip(before) {
+            assert_eq!(
+                fs::read(directory.path().join(path)).expect("unchanged migration input"),
+                expected
+            );
+        }
+
+        write(
+            &project.join("model.yaml"),
+            &legacy_model.replace("file:SPEC.md#L1-L1", "file:src/lib.rs"),
+        );
+        write(
+            &project.join("events.jsonl"),
+            &legacy_events.replace(
+                "file:README.md",
+                "commit:1111111111111111111111111111111111111111",
+            ),
+        );
+        let report = migrate(directory.path()).expect("v2 to v3 migration");
+        assert_eq!(report.from_version, 2);
+        assert_eq!(report.to_version, 3);
+        assert!(report.model_migrated);
+        assert_eq!(report.events_migrated, 1);
+        assert!(validate(&directory).valid);
+        assert!(
+            fs::read_to_string(project.join("model.yaml"))
+                .expect("migrated model")
+                .contains("schema_version: 3")
+        );
+        assert!(
+            fs::read_to_string(project.join("events.jsonl"))
+                .expect("migrated events")
+                .contains("\"schema_version\":3")
+        );
+    }
+
+    #[test]
+    fn event_mutation_rejects_document_evidence_even_for_legacy_stores() {
+        let directory = initialized();
+        let mut input = decision("document evidence");
+        input.evidence = vec!["file:README.md#L1-L1".to_owned()];
+        let error = add_decision(directory.path(), input).expect_err("document evidence rejected");
+        assert!(matches!(
+            error,
+            StoreError::Environment(message) if message.contains("document evidence is forbidden")
+        ));
+    }
+
+    #[test]
     fn generated_event_ids_have_no_integer_ceiling() {
         let directory = initialized();
         let existing = concat!(
-            "{\"schema_version\":2,\"type\":\"decision\",",
+            "{\"schema_version\":3,\"type\":\"decision\",",
             "\"id\":\"D-184467440737095516160000\",\"date\":\"2026-07-17\",",
             "\"subject\":\"old\",\"decision\":\"old\",\"reason\":\"old\"}\n"
         );
@@ -4092,12 +4593,12 @@ mod tests {
     #[test]
     fn validation_rejects_unknown_fields_versions_ids_and_dates() {
         let cases = [
-            json!({"schema_version":2,"type":"gap","id":"G-1","date":"2026-07-17","subject":"x"}),
-            json!({"schema_version":2,"type":"decision","id":"A-1","date":"2026-07-17","subject":"x","decision":"x","reason":"x"}),
-            json!({"schema_version":3,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x"}),
-            json!({"schema_version":2,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x","unknown":true}),
-            json!({"schema_version":2,"type":"attempt","id":"A-1","date":"2026-99-99","subject":"x","approach":"x","result":"failed","finding":"x"}),
-            json!({"schema_version":2,"type":"attempt","id":"A-1","date":"2026-07-17","occurred_at":"2026-07-18T00:00:00+09:00","subject":"x","approach":"x","result":"failed","finding":"x"}),
+            json!({"schema_version":3,"type":"gap","id":"G-1","date":"2026-07-17","subject":"x"}),
+            json!({"schema_version":3,"type":"decision","id":"A-1","date":"2026-07-17","subject":"x","decision":"x","reason":"x"}),
+            json!({"schema_version":4,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x"}),
+            json!({"schema_version":3,"type":"attempt","id":"A-1","date":"2026-07-17","subject":"x","approach":"x","result":"failed","finding":"x","unknown":true}),
+            json!({"schema_version":3,"type":"attempt","id":"A-1","date":"2026-99-99","subject":"x","approach":"x","result":"failed","finding":"x"}),
+            json!({"schema_version":3,"type":"attempt","id":"A-1","date":"2026-07-17","occurred_at":"2026-07-18T00:00:00+09:00","subject":"x","approach":"x","result":"failed","finding":"x"}),
         ];
         for event in cases {
             let directory = initialized();
@@ -4173,20 +4674,26 @@ mod tests {
         fs::copy(project.join("events.jsonl"), &base_events).expect("copy base events");
         let inventory = temporary.path().join("inventory");
         fs::create_dir(&inventory).expect("inventory directory");
+        let commit_one = "1111111111111111111111111111111111111111";
+        let commit_two = "2222222222222222222222222222222222222222";
+        let commit_three = "3333333333333333333333333333333333333333";
         write(
             &inventory.join("summary.json"),
-            r#"{"selected":{"git":true,"conversations":false,"non_ignored_untracked":false},"counts":{"commits":0,"conversation_records":0,"decision_signals":0,"documents":2,"document_blocks":4}}"#,
+            r#"{"selected":{"git":true,"conversations":false,"non_ignored_untracked":false},"counts":{"commits":3,"conversation_records":0,"decision_signals":0,"documents":2,"document_blocks":4}}"#,
         );
         write(
-            &inventory.join("coverage-sources.json"),
-            r#"{"version":2,"sources":{"commit-coverage.jsonl":[],"conversation-coverage.jsonl":[],"decision-coverage.jsonl":[],"document-coverage.jsonl":["file:SPEC.md#L1-L1","file:SPEC.md#L3-L3","file:SPEC.md#L5-L5","file:binary.txt"]}}"#,
+            &inventory.join("commits.jsonl"),
+            &format!(
+                "{{\"commit\":\"{commit_one}\",\"patch\":\"patches/one.patch\"}}\n{{\"commit\":\"{commit_two}\",\"patch\":\"patches/two.patch\"}}\n{{\"commit\":\"{commit_three}\",\"patch\":\"patches/three.patch\"}}\n"
+            ),
         );
-        for name in [
-            "commits.jsonl",
-            "commit-coverage.jsonl",
-            "conversation-coverage.jsonl",
-            "decision-coverage.jsonl",
-        ] {
+        write(
+            &inventory.join("commit-coverage.jsonl"),
+            &format!(
+                "{{\"source\":\"commit:.:{commit_one}\",\"status\":\"analyzed\"}}\n{{\"source\":\"commit:.:{commit_two}\",\"status\":\"analyzed\"}}\n{{\"source\":\"commit:.:{commit_three}\",\"status\":\"analyzed\"}}\n"
+            ),
+        );
+        for name in ["conversation-coverage.jsonl", "decision-coverage.jsonl"] {
             write(&inventory.join(name), "");
         }
         write(
@@ -4195,11 +4702,11 @@ mod tests {
         );
         write(
             &inventory.join("document-coverage.jsonl"),
-            concat!(
-                "{\"source\":\"file:SPEC.md#L1-L1\",\"status\":\"model\",\"topic\":\"thought flow\",\"candidate\":\"principles:sentence-thought-flow\",\"statement\":\"Enter complete mixed-language thoughts.\"}\n",
-                "{\"source\":\"file:SPEC.md#L3-L3\",\"status\":\"model\",\"topic\":\"MVP boundary\",\"candidate\":\"constraints:explicit-mvp-exclusions\",\"statement\":\"Keep background deep context outside the MVP.\"}\n",
-                "{\"source\":\"file:SPEC.md#L5-L5\",\"status\":\"model\",\"topic\":\"routing priority\",\"candidate\":\"principles:latency-first-routing\",\"statement\":\"Prioritize response latency when routing providers.\"}\n",
-                "{\"source\":\"file:binary.txt\",\"status\":\"unavailable\",\"reason\":\"document is not UTF-8\"}\n",
+            &format!(
+                "{{\"source\":\"file:SPEC.md#L1-L1\",\"status\":\"model\",\"topic\":\"thought flow\",\"candidate\":\"principles:sentence-thought-flow\",\"statement\":\"Enter complete mixed-language thoughts.\",\"supported_by\":[\"commit:{commit_one}\"]}}\n\
+                 {{\"source\":\"file:SPEC.md#L3-L3\",\"status\":\"model\",\"topic\":\"MVP boundary\",\"candidate\":\"constraints:explicit-mvp-exclusions\",\"statement\":\"Keep background deep context outside the MVP.\",\"supported_by\":[\"commit:{commit_two}\"]}}\n\
+                 {{\"source\":\"file:SPEC.md#L5-L5\",\"status\":\"model\",\"topic\":\"routing priority\",\"candidate\":\"principles:latency-first-routing\",\"statement\":\"Prioritize response latency when routing providers.\",\"supported_by\":[\"commit:{commit_three}\"]}}\n\
+                 {{\"source\":\"file:binary.txt\",\"status\":\"unavailable\",\"reason\":\"document is not UTF-8\"}}\n"
             ),
         );
         let documents = inventory.join("documents");
@@ -4216,14 +4723,24 @@ mod tests {
             "bytes": specification.len(),
             "sha256": format!("{:x}", Sha256::digest(specification.as_bytes())),
             "blocks": [
-                {"source": "file:SPEC.md#L1-L1", "start": 1, "end": 1},
-                {"source": "file:SPEC.md#L3-L3", "start": 3, "end": 3},
-                {"source": "file:SPEC.md#L5-L5", "start": 5, "end": 5}
+                {"source": "file:SPEC.md#L1-L1", "start": 1, "end": 1, "line_origins": [{"line": 1, "commit": commit_one}]},
+                {"source": "file:SPEC.md#L3-L3", "start": 3, "end": 3, "line_origins": [{"line": 3, "commit": commit_two}]},
+                {"source": "file:SPEC.md#L5-L5", "start": 5, "end": 5, "line_origins": [{"line": 5, "commit": commit_three}]}
             ]
         });
+        let binary_record = json!({
+            "path": "binary.txt",
+            "snapshot": null,
+            "unavailable_reason": "document is not UTF-8"
+        });
+        let documents_inventory = format!("{document_record}\n{binary_record}\n");
+        write(&inventory.join("documents.jsonl"), &documents_inventory);
         write(
-            &inventory.join("documents.jsonl"),
-            &format!("{document_record}\n{{\"path\":\"binary.txt\",\"snapshot\":null}}\n"),
+            &inventory.join("coverage-sources.json"),
+            &format!(
+                "{{\"version\":3,\"frozen_artifacts\":{{\"documents.jsonl\":\"{:x}\"}},\"sources\":{{\"commit-coverage.jsonl\":[\"commit:.:{commit_one}\",\"commit:.:{commit_two}\",\"commit:.:{commit_three}\"],\"conversation-coverage.jsonl\":[],\"decision-coverage.jsonl\":[],\"document-coverage.jsonl\":[\"file:SPEC.md#L1-L1\",\"file:SPEC.md#L3-L3\",\"file:SPEC.md#L5-L5\",\"file:binary.txt\"]}}}}",
+                Sha256::digest(documents_inventory.as_bytes())
+            ),
         );
         let proposed_model = temporary.path().join("proposed-model.yaml");
         let proposed_events = temporary.path().join("proposed-events.jsonl");
@@ -4234,12 +4751,12 @@ mod tests {
             {
                 "id": "sentence-thought-flow",
                 "statement": "Enter complete mixed-language thoughts.",
-                "evidence": [{"ref": "file:SPEC.md#L1-L1", "role": "context"}]
+                "evidence": [{"ref": format!("commit:{commit_one}"), "role": "context"}]
             },
             {
                 "id": "latency-first-routing",
                 "statement": "Prioritize response latency when routing providers.",
-                "evidence": [{"ref": "file:SPEC.md#L5-L5", "role": "context"}]
+                "evidence": [{"ref": format!("commit:{commit_three}"), "role": "context"}]
             }
         ]);
         proposed["constraints"] = json!([]);
@@ -4265,7 +4782,7 @@ mod tests {
         proposed["constraints"] = json!([{
             "id": "explicit-mvp-exclusions",
             "statement": "Keep background deep context outside the MVP.",
-            "evidence": [{"ref": "file:SPEC.md#L1-L1", "role": "context"}]
+            "evidence": [{"ref": format!("commit:{commit_one}"), "role": "context"}]
         }]);
         write(
             &proposed_model,
@@ -4276,10 +4793,10 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::Invalid(report)
-                if report.errors.iter().any(|item| item.contains("absent from 'constraints:explicit-mvp-exclusions'"))
+                if report.errors.iter().any(|item| item.contains("support") && item.contains("explicit-mvp-exclusions"))
         ));
         proposed["constraints"][0]["evidence"] =
-            json!([{"ref": "file:SPEC.md#L3-L3", "role": "context"}]);
+            json!([{"ref": format!("commit:{commit_two}"), "role": "context"}]);
         write(
             &proposed_model,
             &serde_yaml_ng::to_string(&proposed).expect("serialize complete model"),
@@ -4306,7 +4823,7 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::Invalid(report)
-                if report.errors.iter().any(|item| item.contains("outside the frozen block inventory"))
+                if report.errors.iter().any(|item| item.contains("forbidden document evidence"))
         ));
         proposed["principles"][0]["evidence"]
             .as_array_mut()
@@ -4318,7 +4835,8 @@ mod tests {
         );
         let schema_before = fs::read(project.join("schemas/model.schema.json"))
             .expect("schema before reconstruction");
-        assert!(check_reconstruction(directory.path(), input()).is_ok());
+        let checked = check_reconstruction(directory.path(), input());
+        assert!(checked.is_ok(), "{checked:?}");
         let report = apply_reconstruction(directory.path(), input()).expect("apply reconstruction");
         assert!(report.model_changed);
         assert_eq!(
@@ -4421,7 +4939,7 @@ mod tests {
     #[test]
     fn add_decision_allocates_id_and_preserves_existing_lines() {
         let directory = initialized();
-        let existing = "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-9\",\"date\":\"2026-07-16\",\"subject\":\"old\",\"decision\":\"old\",\"reason\":\"old\"}\n";
+        let existing = "{\"schema_version\":3,\"type\":\"decision\",\"id\":\"D-9\",\"date\":\"2026-07-16\",\"subject\":\"old\",\"decision\":\"old\",\"reason\":\"old\"}\n";
         write(
             &directory.path().join(".project-context/events.jsonl"),
             existing,
@@ -4443,7 +4961,7 @@ mod tests {
         let directory = initialized();
         write(
             &directory.path().join(".project-context/events.jsonl"),
-            "{\"schema_version\":2,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-06-27\",\"subject\":\"later\",\"decision\":\"later\",\"reason\":\"later\"}\n",
+            "{\"schema_version\":3,\"type\":\"decision\",\"id\":\"D-1\",\"date\":\"2026-06-27\",\"subject\":\"later\",\"decision\":\"later\",\"reason\":\"later\"}\n",
         );
         let mut input = attempt("inconclusive");
         input.id = Some("A-42".to_owned());

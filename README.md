@@ -23,7 +23,7 @@ The official GitHub repository is `k2nr/project-context-skill`.
 Copy this instruction verbatim:
 
 ```text
-Install Project Context v0.3.0 into the current repository.
+Install Project Context v0.4.0 into the current repository.
 
 Official GitHub repository:
 k2nr/project-context-skill
@@ -33,13 +33,13 @@ Installation requirements:
    project ID, concise description, and real build, test, lint, and format
    commands. Explicitly identify any operation category that intentionally has
    no command.
-2. Download these assets for tag v0.3.0 into a private temporary directory:
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.3.0/install-project-context-v0.3.0
-   - https://github.com/k2nr/project-context-skill/releases/download/v0.3.0/install-project-context-v0.3.0.sha256
-3. Verify the installer with `sha256sum -c install-project-context-v0.3.0.sha256`
-   or `shasum -a 256 -c install-project-context-v0.3.0.sha256`. Stop if it fails.
+2. Download these assets for tag v0.4.0 into a private temporary directory:
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.4.0/install-project-context-v0.4.0
+   - https://github.com/k2nr/project-context-skill/releases/download/v0.4.0/install-project-context-v0.4.0.sha256
+3. Verify the installer with `sha256sum -c install-project-context-v0.4.0.sha256`
+   or `shasum -a 256 -c install-project-context-v0.4.0.sha256`. Stop if it fails.
 4. If `gh` already exists, run
-   `gh attestation verify install-project-context-v0.3.0 --repo k2nr/project-context-skill`.
+   `gh attestation verify install-project-context-v0.4.0 --repo k2nr/project-context-skill`.
    Stop if it fails. Do not install `gh`, Python packages, Cargo, shellcheck, or
    another tool solely for installation.
 5. Make the verified installer executable. Run it first with
@@ -60,7 +60,7 @@ Installation requirements:
 Example installer arguments after repository inspection:
 
 ```sh
-./install-project-context-v0.3.0 \
+./install-project-context-v0.4.0 \
   --format json \
   --project-id example-project \
   --description 'Concise project purpose.' \
@@ -140,10 +140,12 @@ validation. Existing intent sections and event history are preserved. Event
 records are stored in timeline order, using exact `occurred_at` timestamps when
 available. Unknown-time same-date records retain their established source position and act as
 barriers; exact timestamps are sorted only on either side of them.
-New stores use schema v2 with structured evidence, typed event relationships,
-evidence-backed model entries, and extensible structured operations. Existing
-schema v1 stores remain readable and can be upgraded atomically with
-`project-context migrate`.
+New stores use schema v3 with structured evidence, typed event relationships,
+evidence-backed model entries, and extensible structured operations. Schema v3
+rejects tracked-document paths as canonical evidence. Existing schema v1 and v2
+stores remain readable; `project-context migrate` lists document references that
+must be replaced, writes nothing while they remain, and otherwise upgrades all
+four canonical files atomically.
 
 The managed block instructs compatible coding agents to load Project Context
 for non-trivial work without explicit user invocation. Skill discovery remains
@@ -187,9 +189,11 @@ coverage cannot conceal missed accepted proposals or reason-qualified choices.
 When Git is selected, reconstruction also freezes tracked documentation from `HEAD`, or from the
 tracked worktree only when that optional source was approved. Every non-empty document block must be
 classified as model intent, a decision, an attempt, recoverable from code/tests/schema, excluded, or
-unavailable. Both the side-effect-free check and transactional apply reject unresolved blocks,
-missing candidates, unsupported recovery evidence, and document evidence used by the wrong
-candidate. Document snapshots and coverage manifests are temporary private inventory data; the
+unavailable. Collection records the origin commit of every non-empty document line; worktree-only
+lines require a matching direct-user signal. Candidates cite complete origin commits or that
+direct-user signal, never the document path. Both the side-effect-free check and transactional apply
+reject unresolved blocks, missing candidates, incomplete provenance, unsupported recovery evidence,
+and any canonical document evidence. Document snapshots and coverage manifests are temporary private inventory data; the
 feature adds no persistent repository files and does not change the canonical store layout.
 
 Packages produced from this source contain exactly the two top-level skill

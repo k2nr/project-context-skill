@@ -5,7 +5,7 @@ architecture:
   - event: D-0007
     kind: origin
   evidence:
-  - ref: file:README.md
+  - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
     role: implementation
   id: repository-installed-skills
   statement: Target repositories contain an automatically loaded project-context skill, an explicitly invoked reconstruct-project-context companion, a managed AGENTS block, and a .project-context store.
@@ -20,15 +20,15 @@ architecture:
   id: rust-cli-launcher
   statement: A Rust CLI owns canonical validation, retrieval, mutation, migration, and atomic reconstruction; a project-local launcher fetches verified prebuilt release binaries for supported targets.
 - event_relations:
-  - event: D-0017
+  - event: D-0032
     kind: origin
   evidence:
   - ref: file:project-context/assets/init/model.schema.json
     role: implementation
   - ref: file:project-context/assets/init/event.schema.json
     role: implementation
-  id: schema-v2-store
-  statement: New stores use schema v2 structured evidence, exact optional event timestamps, typed relations, model provenance, and structured extensible operations; schema v1 remains readable and atomically migratable.
+  id: schema-v3-store
+  statement: New stores use schema v3 structured evidence and forbid tracked-document paths as canonical evidence; schema v1 and v2 remain readable and migrate atomically after explicit evidence repair.
 - event_relations:
   - event: D-0005
     kind: implementation
@@ -121,7 +121,7 @@ behaviors:
   - event: D-0004
     kind: origin
   evidence:
-  - ref: file:project-context/SKILL.md
+  - ref: commit:e1c761d3136cef9dc065a54a2d1daa1b5acce3af
     role: implementation
   id: automatic-context-retrieval
   statement: For non-trivial repository work, retrieve relevant current intent and connected decision or attempt history without waiting for explicit invocation.
@@ -139,7 +139,7 @@ behaviors:
   - event: D-0012
     kind: implementation
   evidence:
-  - ref: file:reconstruct-project-context/SKILL.md
+  - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
     role: implementation
   id: scope-gated-reconstruction
   statement: Ask one source-scope question before substantive reconstruction when the user has not already selected sources, then automatically apply qualified candidates after both coverage gates pass.
@@ -147,7 +147,7 @@ behaviors:
   - event: D-0015
     kind: origin
   evidence:
-  - ref: file:project-context/SKILL.md
+  - ref: commit:8c750a1c87336d171b65870dcaa5195eeef921af
     role: implementation
   id: explicit-safe-update
   statement: The project-context update workflow performs a verified dry run before applying and stops on local managed-file drift.
@@ -213,11 +213,13 @@ behaviors:
 - event_relations:
   - event: D-0031
     kind: origin
+  - event: D-0032
+    kind: constraint
   evidence:
   - ref: file:reconstruct-project-context/scripts/inventory_local_history.py
     role: implementation
   id: tracked-document-completeness
-  statement: Reconstruction audits every block of selected tracked documentation and blocks apply until each block maps to durable model intent, a decision or attempt candidate, recoverable code or test evidence, an exclusion, or an unavailable reason.
+  statement: Reconstruction audits every selected tracked-document block, requires complete line-origin commits or matching direct-user support for durable candidates, and never persists document paths as canonical evidence.
 - evidence:
   - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
     role: implementation
@@ -255,7 +257,7 @@ constraints:
   - event: D-0010
     kind: origin
   evidence:
-  - ref: file:reconstruct-project-context/references/sources.md
+  - ref: commit:0a2ac1452ec9c7223aac566428d13233a6cedfdb
     role: implementation
   id: local-reconstruction-only
   statement: Reconstruction may use approved local repository data and repository-associated local Codex or Claude sessions, but never external services or unrelated conversations.
@@ -263,7 +265,7 @@ constraints:
   - event: D-0014
     kind: origin
   evidence:
-  - ref: file:reconstruct-project-context/references/qualification.md
+  - ref: commit:0a2ac1452ec9c7223aac566428d13233a6cedfdb
     role: implementation
   id: canonical-blindness
   statement: Current and historical .project-context/model.yaml and events.jsonl are never reconstruction evidence; base snapshots are opaque preservation and concurrency inputs only.
@@ -271,7 +273,7 @@ constraints:
   - event: D-0002
     kind: constraint
   evidence:
-  - ref: file:README.md
+  - ref: commit:e1c761d3136cef9dc065a54a2d1daa1b5acce3af
     role: implementation
   id: supported-platforms
   statement: Published prebuilt binaries support macOS 11 or newer and GNU Linux with glibc 2.31 or newer on x86_64 and arm64; musl, Windows, and other targets are unsupported.
@@ -281,7 +283,7 @@ constraints:
   - event: D-0015
     kind: constraint
   evidence:
-  - ref: file:README.md
+  - ref: commit:168e350cff01f9df3d4a898c2afa97c4e0534922
     role: implementation
   id: managed-drift-is-conflict
   statement: Install and update never overwrite differing installed skills or malformed or locally modified managed AGENTS content; conflict exits require human direction.
@@ -289,7 +291,7 @@ constraints:
   - event: D-0011
     kind: origin
   evidence:
-  - ref: file:reconstruct-project-context/SKILL.md
+  - ref: commit:b1d65e293e763b06715ccd821b2de7bfe75baaac
     role: implementation
   id: release-work-is-separate
   statement: Feature implementation does not implicitly choose a next version, create tags, publish releases, or add unspecified automatic upgrades.
@@ -297,7 +299,7 @@ constraints:
   - event: D-0006
     kind: origin
   evidence:
-  - ref: file:project-context/SKILL.md
+  - ref: commit:e1c761d3136cef9dc065a54a2d1daa1b5acce3af
     role: implementation
   id: project-commit-rules-first
   statement: Project-specific commit rules take precedence; Project Context commit guidance applies only where compatible.
@@ -376,28 +378,30 @@ principles:
   - event: D-0003
     kind: origin
   evidence:
-  - ref: file:README.md
+  - ref: commit:e1c761d3136cef9dc065a54a2d1daa1b5acce3af
     role: implementation
   id: ai-agent-interface
   statement: Optimize canonical context and workflows for AI consumption in solo projects where the human uses an AI agent as the codebase interface.
 - evidence:
-  - ref: file:project-context/SKILL.md
+  - ref: commit:e1c761d3136cef9dc065a54a2d1daa1b5acce3af
     role: implementation
   id: durable-only
   statement: Persist only intent, rationale, or costly findings that cannot be recovered reliably from current code, tests, schemas, and Git.
 - event_relations:
   - event: D-0014
     kind: rationale
+  - event: D-0032
+    kind: constraint
   evidence:
-  - ref: file:reconstruct-project-context/SKILL.md
+  - ref: commit:db8fe7a7444cd243049176568fe121b140302434
     role: implementation
   id: evidence-before-conclusions
-  statement: Reconstruction conclusions must be evidence-qualified, cover every selected source, tracked-document block, and direct-user signal, and never use canonical model/events as truth.
+  statement: Reconstruction conclusions must cover every selected source, tracked-document block, and direct-user signal with non-document evidence, and never use canonical model/events as truth.
 - event_relations:
   - event: D-0005
     kind: origin
   evidence:
-  - ref: file:README.md
+  - ref: commit:168e350cff01f9df3d4a898c2afa97c4e0534922
     role: implementation
   id: preserve-local-state
   statement: Install, update, migration, and reconstruction operations fail closed on conflicts and preserve unrelated local state.
@@ -436,4 +440,4 @@ principles:
 project:
   description: A repository-installed skill and CLI that preserve, retrieve, reconstruct, and safely evolve durable project intent for AI-agent-driven software projects.
   id: project-context-skill
-schema_version: 2
+schema_version: 3
